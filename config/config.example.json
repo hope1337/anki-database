@@ -1,17 +1,103 @@
 {
-    "_comment": "EXAMPLE config - safe to commit. Copy to config.local.json (same directory) and adjust for your machine. Never put secrets/API keys in tracked files.",
+    "_comment": "EXAMPLE config - safe to commit. This file is a template: copy it to config.local.json (same directory, untracked) and adjust values for your machine. config.local.json is the normal machine/user config and the main source of truth at runtime. Standard JSON has no comments, so documentation lives in keys starting with _comment, _options or _description - the loader ignores ONLY those prefixes; any other unknown key (e.g. a typo like modle_id) still produces a warning. Never put secrets/API keys/tokens in tracked files.",
+    "_comment_runtime": "TEXT generation is configurable (generation.text.mode local|endpoint). Text local = Hugging Face runtime model, lazy-loaded, first actual generate.py run downloads missing files into the normal HF cache and reuses them afterwards. Text endpoint = OpenAI-compatible API (llama.cpp-style, current working behavior). AUDIO has no model/backend selection: character pronunciation comes ONLY from the fixed CNS11643 human-recorded source (download.py section 4c; exact archive URLs UNKNOWN / NEEDS VERIFICATION). There is no TTS fallback and no sentence synthesis. Nothing here auto-downloads models; download.py fetches reference data (strokes, Unihan, CNS audio) and must NEVER fetch AI model weights for audio.",
     "mode": "test",
+    "_options_mode": ["test", "official"],
+    "_comment_mode": "test = generate only test_characters below. official = generate the full supported stroke dataset.",
     "profile": "vi",
-    "test_character": "思",
+    "_comment_profile": "Learner-language profile code. Profile files live in config/profiles/<code>.json (vi, en shipped). 'vi' enables Han-Viet display; 'en' does not. This is profile-driven, not hardcoded.",
+    "test_characters": [
+        "思",
+        "八",
+        "乾",
+        "差",
+        "心",
+        "學",
+        "明",
+        "好",
+        "中",
+        "愛"
+    ],
+    "_comment_test_characters": "Explicit TEST subset used only when mode=test. Must hold exactly 10 single characters, no duplicates, all present in the supported stroke dataset. Order is preserved. Edit this list to change the test set later. There is no singular test_character key.",
+    "_comment_llm": "LEGACY top-level block, kept for backward compatibility: its values migrate into generation.text.endpoint (endpoint mode). Prefer editing generation.text.endpoint directly. base_url/model are NOT secrets, but keep real endpoints in untracked config.local.json. API keys/tokens, if ever needed, must come from environment variables - never from this file.",
     "llm": {
         "base_url": "http://127.0.0.1:8080/v1",
+        "_comment_base_url": "Endpoint base URL (example points at a local server). No trailing /chat/completions; the client appends it. Only used in endpoint mode.",
         "model": "example-model-alias",
+        "_comment_model": "Model alias exposed by the server, not a secret. Recorded in manifests as provenance only. Part of the text cache identity: changing it regenerates enrichment.",
         "timeout_seconds": 180,
-        "trust_env": false
+        "_comment_timeout_seconds": "HTTP timeout per enrichment request in seconds. Only used in endpoint mode.",
+        "trust_env": false,
+        "_comment_trust_env": "false ignores HTTP(S)_PROXY env vars so local requests are not routed through a proxy by accident. Only used in endpoint mode."
     },
+    "_comment_audio": "Character pronunciation audio comes EXCLUSIVELY from the fixed CNS11643 human-recorded source (dataset https://data.gov.tw/dataset/5961; files under https://www.cns11643.gov.tw/opendata/ — see download.py section 4c + cns_audio.py). download.py resolves the official OpenDataFilesList.csv/release.txt first (versions recorded), then fetches Voice.zip (male/female.mp3 via official readme table), Properties.zip (CNS_phonetic.txt code->bopomofo) and MapingTables.zip (CNS->Unicode join), and builds data/processed/cns11643/cns_index.json automatically (skipped when inputs unchanged). There is NO model/provider/endpoint/runtime choice. Matching is exact (character + expected Zhuyin); a missing reading means the card has no audio — never synthesized, never substituted. Reruns skip complete files, resume partials, --force reacquires. Old TTS fields (mode/provider/repo_id/variant/...) are REJECTED with a migration error, not warned.",
+    "audio": {
+        "source": "cns11643",
+        "_comment_source": "Fixed pronunciation source. Only 'cns11643' is valid.",
+        "preferred_voice": "auto",
+        "_options_preferred_voice": ["auto", "male", "female"],
+        "_comment_preferred_voice": "Selects ONLY among same-reading CNS human recordings, and only when source records carry voice metadata (else inert). 'auto' = deterministic default (first sorted). This is NOT model selection. A missing requested reading still yields no audio — never another reading."
+    },
+    "_comment_generation": "Output/packaging options plus the config-driven TEXT backend (model selection exists ONLY for text/LLM). refresh_ai=true ignores cached enrichment and regenerates it.",
     "generation": {
         "refresh_ai": false,
+        "_comment_refresh_ai": "true = bypass the per-profile text cache and regenerate enrichment.",
         "deck_name": "Taiwan Traditional Chinese - MOE",
-        "output": "build/taiwan_traditional_chinese.apkg"
+        "_comment_deck_name": "Anki deck name written into the .apkg package.",
+        "output": "build/taiwan_traditional_chinese.apkg",
+        "_comment_output": "Output .apkg path, relative to the project root.",
+        "_comment_text": "Text-generation backend (learner-facing enrichment). mode selects local|endpoint. Both modes render the same prompt files (prompt.system_file/user_file). Model selection exists ONLY here — audio has none.",
+        "text": {
+            "mode": "endpoint",
+            "_options_mode": ["local", "endpoint"],
+            "_comment_mode": "endpoint = call a configured API (current working behavior; default). local = run a Hugging Face model in-process. Changing mode invalidates the text cache.",
+            "_comment_local": "Local text backend. Used ONLY when text.mode=local. Values join the text cache identity.",
+            "local": {
+                "provider": "huggingface",
+                "_options_provider": ["huggingface"],
+                "_comment_provider": "Local text provider implementation. Only 'huggingface' exists. Changing it invalidates the text cache.",
+                "model_id": "Qwen/Qwen2.5-0.5B-Instruct",
+                "_comment_model_id": "Hugging Face model repository used in local mode. Missing model files are downloaded on first actual generate.py run and then reused from the HF cache (HF_HOME or ~/.cache/huggingface). Small default chosen as sensible for an 8 GB VRAM laptop; any repository stays configurable and no memory limit is enforced. Changing it invalidates the text cache.",
+                "revision": "",
+                "_comment_revision": "Optional model revision/tag/commit. Empty means the repository default (unpinned, may drift). Pin for reproducible official generation. Changing it invalidates the text cache.",
+                "device": "cuda",
+                "_comment_device": "Execution device such as cuda or cpu. User-configurable; not tied to any specific GPU. Changing it invalidates the text cache.",
+                "dtype": "auto",
+                "_comment_dtype": "Model dtype: auto, float16, bfloat16, float32. auto lets the loader decide. Changing it invalidates the text cache.",
+                "generation": {
+                    "temperature": 0.2,
+                    "max_tokens": 1200
+                },
+                "_comment_generation": "Generation parameters shared by both modes (endpoint maps them onto the chat-completions payload; local maps them onto generate kwargs). temperature 0.2 = focused enrichment. Changing any value invalidates the text cache."
+            },
+            "_comment_endpoint": "Endpoint text backend. Used ONLY when text.mode=endpoint. Preserves the working llama.cpp OpenAI-compatible behavior.",
+            "endpoint": {
+                "provider": "openai_compatible",
+                "_options_provider": ["openai_compatible"],
+                "_comment_provider": "Endpoint protocol. Only 'openai_compatible' exists (POST {base_url}/v1/chat/completions). Changing it invalidates the text cache.",
+                "base_url": "http://127.0.0.1:8080/v1",
+                "_comment_base_url": "Endpoint base URL (example points at a local server). No trailing /chat/completions; the client appends it. Only used in endpoint mode. NEVER published into manifests. Changing it does NOT invalidate the text cache (same model alias + prompts reuse cache).",
+                "model": "example-model-alias",
+                "_comment_model": "Model alias exposed by the server, not a secret. Recorded in manifests as provenance only. Part of the text cache identity: changing it regenerates enrichment. Only used in endpoint mode.",
+                "timeout_seconds": 180,
+                "_comment_timeout_seconds": "HTTP timeout per enrichment request in seconds. Only used in endpoint mode. Changing it does NOT invalidate the text cache.",
+                "trust_env": false,
+                "_comment_trust_env": "false ignores HTTP(S)_PROXY env vars so local requests are not routed through a proxy by accident. Only used in endpoint mode.",
+                "api_key_env": "",
+                "_comment_api_key_env": "Optional NAME of an environment variable holding an API bearer token (e.g. MY_LLM_KEY). The secret itself is read from the environment at synthesis time and never stored in config, caches, or manifests. Empty = no auth header. Only used in endpoint mode.",
+                "generation": {
+                    "temperature": 0.2,
+                    "max_tokens": 1200
+                },
+                "_comment_generation": "Payload parameters: temperature 0.2 plus max_tokens 1200, with response_format json_object (retried without it when the server rejects it). Changing any value invalidates the text cache."
+            },
+            "_comment_prompt": "Prompt files. Both text modes render these. Editing EITHER file automatically invalidates the text cache via content hashes.",
+            "prompt": {
+                "system_file": "config/prompts/text_system.txt",
+                "_comment_system_file": "System-prompt template. Required placeholders: {language_name} {profile_instruction} {max_sayings} {target_char}. Path relative to the project root.",
+                "user_file": "config/prompts/text_user.txt",
+                "_comment_user_file": "User-prompt template wrapping SOURCE_FACTS (authoritative Unihan ground truth). Required placeholder: {facts_json}. Path relative to the project root."
+            }
+        }
     }
 }

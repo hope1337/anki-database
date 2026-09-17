@@ -1,0 +1,67 @@
+You are creating Traditional Chinese learner content for a learner whose
+destination language is {language_name}.
+
+The data in SOURCE_FACTS is ground truth from Unicode Unihan (romanization,
+radical, stroke count, variants, English definition). Do not modify these
+facts and do not derive Zhuyin yourself.
+
+Profile instruction:
+{profile_instruction}
+
+Mandatory rules:
+1. Always use TAIWAN Traditional Chinese in example sentences.
+2. "meaning" must be a natural, short, useful gloss in the destination
+   language, grounded in the unicode_definition_en provided.
+3. "structure_explanation" may only describe a memory-level breakdown for
+   learners (AI enrichment, NOT authoritative IDS data). Do not invent
+   historical etymology. If the data is insufficient, briefly say so
+   instead of concluding.
+4. "components_generated" are AI-suggested memory components, not
+   authoritative CHISE/Unicode data. "component_meanings" only glosses
+   those components in the destination language.
+5. "han_viet_suggestion": optionally suggest a Sino-Vietnamese-style
+   reading aid for the learner; this is an AI value, never an official
+   reading. Leave it empty when it adds no value for this destination
+   language.
+  6. Create 2 natural example sentences at level A2-B1, preferring usage
+    common in Taiwan. Each example must have:
+    - zh: Traditional Chinese
+    - pinyin: Hanyu Pinyin with tone marks
+    - translation: natural translation in the destination language
+ 7. "notable_sayings": 0 to {max_sayings} genuinely well-known
+    quotations, proverbs, idioms, maxims, or classical sayings that CONTAIN
+    the target character ("{target_char}"). Prefer sayings with real currency in
+    Taiwan / Han cultural life. NEVER fabricate a quotation to fill the
+    field: return [] when uncertain. Each item must have:
+    - traditional: exact Traditional Chinese wording (must contain "{target_char}")
+    - pinyin: Hanyu Pinyin with tone marks for the COMPLETE saying
+    - translation: natural translation in the destination language
+    - type: one of quotation|proverb|idiom|maxim|classical
+    - source: attribution when known, else "" (never invent certainty;
+      classical lines often have textual variants)
+    - language_specific.han_viet: Sino-Vietnamese reading of the full
+      saying (include only when the profile instruction asks for
+      Sino-Vietnamese readings; else omit it)
+    Generated sayings are enrichment, not authoritative reference data.
+ 8. Return valid JSON only. No Markdown, no explanation outside JSON.
+
+Schema:
+{{
+  "meaning": "...",
+  "han_viet_suggestion": "...",
+  "structure_explanation": "...",
+  "components_generated": ["...", "..."],
+  "component_meanings": {{
+    "心": "...",
+    "田": "..."
+  }},
+  "examples": [
+    {{"zh": "...", "pinyin": "...", "translation": "..."}},
+    {{"zh": "...", "pinyin": "...", "translation": "..."}}
+  ],
+  "notable_sayings": [
+    {{"traditional": "...", "pinyin": "...", "translation": "...",
+      "type": "quotation", "source": "...",
+      "language_specific": {{"han_viet": "..."}}}}
+  ]
+}}

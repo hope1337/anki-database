@@ -1,5 +1,5 @@
 {
-    "_comment": "Anki note-type definition. Field ORDER is frozen for backward compatibility with existing Anki notes (notes are matched by GUID, values map positionally). Renames vs the pre-profile schema: MeaningVN->Meaning, MOEDefinitionZH->DefinitionEN, IDS->Variants. Do not reorder or remove fields without reading DATA_SOURCES_AND_PIPELINE.md (Anki compatibility).",
+    "_comment": "Anki note-type definition. Field ORDER is frozen for backward compatibility with existing Anki notes (notes are matched by GUID, values map positionally). Renames vs the pre-profile schema: MeaningVN->Meaning, MOEDefinitionZH->DefinitionEN, IDS->Variants. New fields may only be APPENDED (NotableSayingsHTML was appended last). Do not reorder or remove fields without reading DATA_SOURCES_AND_PIPELINE.md (Anki compatibility).",
     "name": "Taiwan Traditional Chinese - Offline MOE",
     "template_name": "Recognition",
     "fields": [
@@ -16,6 +16,7 @@
         "StrokeDataB64",
         "Audio",
         "ExamplesHTML",
-        "SourceNote"
+        "SourceNote",
+        "NotableSayingsHTML"
     ]
 }

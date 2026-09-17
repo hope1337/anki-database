@@ -11,6 +11,7 @@
         "structure": "Cấu tạo chữ",
         "stroke_order": "Thứ tự nét",
         "examples": "Ví dụ",
+        "notable_sayings": "Danh ngôn & câu nổi tiếng",
         "other_readings_title": "Âm đọc khác (Unihan)",
         "table_pinyin": "Pinyin",
         "table_zhuyin": "Zhuyin",
@@ -30,7 +31,8 @@
     },
 
     "features": {
-        "show_han_viet": true
+        "show_han_viet": true,
+        "notable_sayings_max_items": 2
     },
 
     "llm": {

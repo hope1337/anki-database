@@ -11,6 +11,7 @@
         "structure": "Character structure",
         "stroke_order": "Stroke order",
         "examples": "Examples",
+        "notable_sayings": "Notable sayings",
         "other_readings_title": "Other readings (Unihan)",
         "table_pinyin": "Pinyin",
         "table_zhuyin": "Zhuyin",
@@ -30,7 +31,8 @@
     },
 
     "features": {
-        "show_han_viet": false
+        "show_han_viet": false,
+        "notable_sayings_max_items": 2
     },
 
     "llm": {

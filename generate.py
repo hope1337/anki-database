@@ -6,31 +6,38 @@ Generate an offline Anki deck for Traditional Chinese using the data layout
 created by download.py.
 
 CLEAN-v1 SOURCE MODEL:
-  MOE Taiwan  = stroke-order geometry + pronunciation audio ONLY.
+  MOE Taiwan  = stroke-order geometry ONLY.
   Unicode Unihan (version-pinned) = ALL factual text (pinyin, radical,
       stroke count, variants, kDefinition English grounding).
+  CNS11643 / 全字庫 = human-recorded Taiwan Mandarin pronunciation audio
+      ONLY (fixed reference source; exact character+Zhuyin lookup, no
+      synthesis, no fallback).
   Deterministic local code = normalization + pinyin->zhuyin + indexes.
   Language profile (config/profiles/<code>.json) = learner language,
       card labels, optional per-language features, LLM instruction.
   LLM = learner-language meaning, structure explanation, component
-      glosses, example sentences. NEVER authoritative facts.
+      glosses, example sentences, notable sayings. NEVER authoritative facts.
+  MOE recordings are NOT used: clips regularly speak more than
+  the isolated target character.
 
-The MOE concise dictionary, CHISE IDS, and the old external Han-Viet
-dataset are LEGACY: their classes remain below in a marked LEGACY section
-for rollback/reference, but the clean path never calls them.
+The MOE concise dictionary, MOE pronunciation recordings, CHISE IDS, and
+the old external Han-Viet dataset are LEGACY: their classes remain below
+in a marked LEGACY section for rollback/reference, but the clean path
+never calls them.
 
 Install:
     pip install genanki requests openpyxl
 
 Local config (config/config.local.json, see config/config.example.json):
-    {"mode": "test"|"official", "profile": "vi", "test_character": "思",
+    {"mode": "test"|"official", "profile": "vi",
+     "test_characters": ["思", "八", ...],
      "llm": {"base_url": ..., "model": ..., "timeout_seconds": 180,
              "trust_env": false}, ...}
-Default mode is TEST (exactly one configurable character).
+Default mode is TEST (exactly the configured test_characters list).
 
 Typical workflow
 ----------------
-Test (default, one character from config):
+Test (default, configured test_characters from config):
     python generate.py
 
 Official (full set):
@@ -43,12 +50,16 @@ Debug overrides:
 Important:
 - LLM results are cached per profile in data/processed/llm/<lang>/.
   Switching profile never reuses another language's enrichment.
+- Character pronunciation comes from data/processed/cns11643/cns_index.json
+  (built by download.py from CNS11643 originals); original CNS bytes are
+  copied unchanged into build media.
 - Normalized card records are saved in data/processed/cards/.
 - Published Android-ready snapshot: data/published/reference-v1/.
 - Re-running does not call the LLM again unless --refresh-ai is used.
-- Audio matching is conservative and NEVER uses MOE dictionary IDs.
-  A wrong audio clip is worse than no clip.
-  Unresolved files are reported in build/audio_missing.json.
+- Pronunciation audio is looked up from CNS11643 by character + expected
+  Zhuyin (see cns_audio.py + config "audio" block). With no exact match,
+  cards simply have no audio — never synthesized, never substituted.
+  Unavailable audio is reported in build/audio_missing.json.
 """
 
 from __future__ import annotations
@@ -69,7 +80,32 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import genanki
-import requests
+
+from cns_audio import (
+    CNS_SOURCE,
+    PREFERRED_VOICES,
+    CharacterAudioResolver,
+    CnsError,
+    normalize_zhuyin,
+    zhuyin_slug,
+)
+
+from prompts import (
+    DEFAULT_SYSTEM_FILE,
+    DEFAULT_USER_FILE,
+    PromptError,
+    prompt_file_hash,
+    render_system,
+    render_user,
+    validate_text_prompts,
+)
+
+from text_providers import (
+    DEFAULT_LOCAL_MODEL_ID,
+    TextProviderError,
+    build_text_provider,
+    text_cache_identity,
+)
 
 try:
     from openpyxl import load_workbook
@@ -93,14 +129,23 @@ MOE_STROKE_XML = MOE_STROKE / "xml"
 STROKE_CATALOG = PROCESSED / "indexes" / "stroke_catalog.jsonl"
 
 MOE_DICT_TEXT = RAW / "moe_dictionary" / "text"
+# LEGACY/DEPRECATED: MOE pronunciation recordings are not downloaded by the
+# clean pipeline and never used by clean generation (CNS11643 human
+# recordings are the fixed pronunciation source).
 MOE_DICT_AUDIO = RAW / "moe_dictionary" / "audio_char"
 
 HANVIET_CSV = RAW / "hanviet" / "hanviet.csv"
 CHISE_DIR = RAW / "chise"
-UNIHAN_DIR = RAW / "unicode" / "unihan"
+UNICODE_DIR = RAW / "unicode"
+UNIHAN_DIR = UNICODE_DIR / "unihan"
 
 LLM_CACHE_DIR = PROCESSED / "llm"
 CARD_CACHE_DIR = PROCESSED / "cards"
+
+# CNS11643 fixed pronunciation source: processed lookup index built by
+# download.py from extracted CNS originals (data/raw/cns11643/).
+CNS11643_RAW = RAW / "cns11643"
+CNS_INDEX_PATH = PROCESSED / "cns11643" / "cns_index.json"
 
 # Published Android-ready snapshot (generated immutable artifact).
 PUBLISHED_ROOT = DATA / "published" / "reference-v1"
@@ -124,8 +169,10 @@ BUILD_REPORTS = BUILD / "reports"
 # Bumped again for the language-profile refactor: the prompt is now
 # target-language agnostic and the output schema uses language-neutral keys
 # (meaning/translation/...) instead of meaning_vi/...vi suffixes.
+# Bumped again for notable_sayings: the output contract gained an optional
+# enrichment list, so old cached enrichment (without it) is invalidated.
 # Changing profile, prompt, or factual input invalidates the LLM cache.
-PROMPT_VERSION = "anki-zh-generic-v1"
+PROMPT_VERSION = "anki-zh-generic-v2"
 
 # Pinned Unicode version for the clean-v1 reproducibility contract.
 # Must match UNICODE_VERSION in download.py. Never "latest".
@@ -134,6 +181,16 @@ UNICODE_VERSION = "17.0.0"
 # Normalized-record + published-dataset schema versions.
 CLEAN_SCHEMA_VERSION = "clean-v1"
 REFERENCE_DATASET_VERSION = "reference-v1"
+
+# Default TEST subset (used when config has no test_characters list).
+# Exactly 10 explicitly listed characters covering: unique audio (八),
+# multi-clip same-reading audio (思), multi-clip different readings (乾),
+# max-clip-count audio (差 4 clips), plus common characters exercising
+# radicals, variants, alternates, and enrichment (心學明好中愛).
+# Every entry must exist in the supported stroke dataset.
+DEFAULT_TEST_CHARACTERS = [
+    "思", "八", "乾", "差", "心", "學", "明", "好", "中", "愛",
+]
 
 # Canonical user-editable configuration lives under config/.
 CONFIG_DIR = ROOT / "config"
@@ -153,11 +210,12 @@ ANKI_MODEL_ID = 1739018113
 ANKI_DECK_ID = 2059418113
 
 # Attribution must NOT claim MOE provided dictionary/definition content:
-# clean-v1 uses MOE for strokes + audio only; text facts come from Unicode.
+# clean-v1 uses MOE for stroke geometry only; text facts come from Unicode;
+# pronunciation audio is human-recorded CNS11643 (see cns_audio.py).
 # The learner-language tail sentence comes from the active profile
 # (labels.attribution_ai); see build_attribution().
 MOE_ATTRIBUTION_BASE = (
-    "筆順與字音：中華民國教育部（MOE Taiwan）。"
+    "筆順：中華民國教育部（MOE Taiwan）。"
     "文字事實：Unicode Unihan。"
 )
 
@@ -298,23 +356,67 @@ def _read_json_first(paths: list[Path]) -> tuple[Any, Path | None]:
 def load_local_config() -> dict:
     """Load config/config.local.json; fall back to built-in defaults.
 
-    Never contacts the network. The LLM endpoint lives here, never in the
-    published dataset manifest.
+    Never contacts the network. Endpoint URLs / model aliases live here,
+    never in the published dataset manifest.
+
+    New config-driven layout (see config/config.example.json):
+
+        generation.text:  {"mode": "local"|"endpoint", "local": {...},
+                           "endpoint": {...}, "prompt": {...}}
+        audio: {"source": "cns11643", "preferred_voice": "auto"}
+
+    Audio has NO model/backend selection: pronunciation comes from the
+    fixed CNS11643 human-recorded source. Backward compatibility: legacy
+    top-level ``llm`` migrates into ``generation.text.endpoint``
+    (endpoint mode preserved). Removed TTS audio configuration is
+    REJECTED with a migration error, never silently accepted.
     """
     defaults = {
         "mode": "test",
         "profile": "vi",
-        "test_character": "思",
+        "test_characters": list(DEFAULT_TEST_CHARACTERS),
         "llm": {
             "base_url": DEFAULT_LLM_BASE_URL,
             "model": DEFAULT_LLM_MODEL,
             "timeout_seconds": DEFAULT_LLM_TIMEOUT,
             "trust_env": False,
         },
+        # Character pronunciation audio: fixed CNS11643 human-recorded
+        # source. NO model/provider/endpoint selection. preferred_voice
+        # selects ONLY among same-reading CNS recordings when the source
+        # records carry voice metadata ("auto" = deterministic default).
+        "audio": {
+            "source": CNS_SOURCE,
+            "preferred_voice": "auto",
+        },
         "generation": {
             "refresh_ai": False,
             "deck_name": "Taiwan Traditional Chinese - MOE",
             "output": str(BUILD / "taiwan_traditional_chinese.apkg"),
+            "text": {
+                "mode": "endpoint",
+                "local": {
+                    "provider": "huggingface",
+                    "model_id": DEFAULT_LOCAL_MODEL_ID,
+                    "revision": "",
+                    "device": "cuda",
+                    "dtype": "auto",
+                    "generation": {"temperature": 0.2, "max_tokens": 1200},
+                },
+                "endpoint": {
+                    "provider": "openai_compatible",
+                    "base_url": DEFAULT_LLM_BASE_URL,
+                    "model": DEFAULT_LLM_MODEL,
+                    "timeout_seconds": DEFAULT_LLM_TIMEOUT,
+                    "trust_env": False,
+                    "api_key_env": "",
+                    "generation": {"temperature": 0.2, "max_tokens": 1200},
+                },
+                "prompt": {
+                    "system_file": DEFAULT_SYSTEM_FILE,
+                    "user_file": DEFAULT_USER_FILE,
+                },
+            },
         },
     }
     user, used_path = _read_json_first([CONFIG_LOCAL])
@@ -329,10 +431,266 @@ def load_local_config() -> dict:
     merged = dict(defaults)
     for key, value in user.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = {**merged[key], **value}
+            if key == "generation" and isinstance(value, dict):
+                gen = dict(merged["generation"])
+                for gkey, gval in value.items():
+                    if (isinstance(gval, dict)
+                            and isinstance(gen.get(gkey), dict)):
+                        sub = dict(gen[gkey])
+                        for skey, sval in gval.items():
+                            if (isinstance(sval, dict)
+                                    and isinstance(sub.get(skey), dict)):
+                                sub[skey] = {**sub[skey], **sval}
+                            else:
+                                sub[skey] = sval
+                        gen[gkey] = sub
+                    else:
+                        gen[gkey] = gval
+                merged[key] = gen
+            else:
+                merged[key] = {**merged[key], **value}
         else:
             merged[key] = value
+    _warn_unknown_config_keys(user)
+    _check_deprecated_audio_config(user)
+    _migrate_legacy_blocks(merged, user)
     return merged
+
+
+def _migrate_legacy_blocks(merged: dict, user: dict) -> None:
+    """Migrate legacy top-level llm into generation.text.endpoint.
+
+    Legacy ``llm`` (base_url/model/timeout/trust_env) maps onto
+    generation.text.endpoint so old configs keep working in endpoint
+    mode. Explicit new-block values always win over migrated values.
+    (Removed TTS audio configuration is NOT migrated: see
+    _check_deprecated_audio_config, which rejects it explicitly.)
+    """
+    gen = merged.get("generation")
+    if not isinstance(gen, dict):
+        return
+    text = gen.get("text")
+    if isinstance(text, dict) and isinstance(user.get("llm"), dict):
+        endpoint = dict(text.get("endpoint", {}))
+        legacy = user["llm"]
+        for key in ("base_url", "model", "timeout_seconds", "trust_env"):
+            if key in legacy and f"{key}" not in (
+                    (user.get("generation") or {}).get("text", {})
+                    .get("endpoint", {})):
+                endpoint[key] = legacy[key]
+        text["endpoint"] = endpoint
+
+
+# Config keys removed with the TTS-architecture deletion. Presence of
+# any of them is a hard error (not a warning): silently continuing
+# through an obsolete audio path would risk wrong pronunciation.
+_DEPRECATED_AUDIO_KEYS = frozenset({
+    "mode", "provider", "local", "endpoint", "runtime", "model_id",
+    "repo_id", "revision", "variant", "speaker_id", "language_id",
+    "execution_provider", "device", "dtype", "speed", "inference",
+    "pronunciation", "reference_audio", "reference_text", "locale",
+    "voice", "format", "rate", "volume", "pitch", "output_format",
+    "timeout_seconds", "supported_locales", "command",
+    "uses_reading_control", "reading_control_mechanism", "settings",
+    "settings_version", "tones", "onnx_file", "phones_file",
+    "onnx_inputs", "sample_rate", "prompt", "base_url", "model",
+    "trust_env", "api_key_env",
+})
+
+
+def _check_deprecated_audio_config(user: dict) -> None:
+    """Reject removed TTS audio configuration with a migration error."""
+    if not isinstance(user, dict):
+        return
+    bad_top = sorted(
+        k for k, v in (user.get("audio") or {}).items()
+        if isinstance(user.get("audio"), dict)
+        and k in _DEPRECATED_AUDIO_KEYS and not _is_doc_key(k))
+    bad_gen: list[str] = []
+    gen_audio = ((user.get("generation") or {}).get("audio")
+                 if isinstance(user.get("generation"), dict) else None)
+    if isinstance(gen_audio, dict):
+        bad_gen = sorted(k for k in gen_audio if not _is_doc_key(k))
+    if bad_top or bad_gen:
+        raise ValueError(
+            "Audio model/backend selection was removed: pronunciation "
+            "now comes ONLY from the fixed CNS11643 human-recorded "
+            "source. Replace your audio config with "
+            "{\"source\": \"cns11643\", "
+            "\"preferred_voice\": \"auto\"} "
+            f"(removed keys: audio.{bad_top}, "
+            f"generation.audio.{bad_gen}). See "
+            "config/config.example.json.")
+
+
+# Documentation keys (see config/config.example.json): ignored everywhere
+# by the loader. Anything else unknown is reported, not silently accepted,
+# so misspelled runtime keys surface as warnings instead of dead config.
+_DOC_KEY_PREFIXES = ("_comment", "_options", "_description")
+
+_KNOWN_CONFIG_KEYS: dict[str, set[str] | None] = {
+    # None = scalar/list value, validated for presence only.
+    "mode": None,
+    "profile": None,
+    "test_characters": None,
+    "llm": {"base_url", "model", "timeout_seconds", "trust_env"},
+    # Audio has NO model/backend selection: fixed CNS11643 source plus
+    # an optional same-reading voice preference only.
+    "audio": {"source", "preferred_voice"},
+    # Nested generation.text block: validated recursively
+    # (see _KNOWN_GENERATION_SUBKEYS). Only documentation prefixes
+    # (_comment*, _options*, _description*) are ignored; real typos
+    # (e.g. "modle_id") still warn.
+    "generation": {"refresh_ai", "deck_name", "output", "text"},
+}
+
+_KNOWN_GENERATION_SUBKEYS: dict[str, Any] = {
+    "text": {
+        "mode": None,
+        "local": {"provider", "model_id", "revision", "device",
+                  "dtype", "generation"},
+        "endpoint": {"provider", "base_url", "model", "timeout_seconds",
+                     "trust_env", "api_key_env", "generation"},
+        "prompt": {"system_file", "user_file"},
+    },
+}
+
+
+def _is_doc_key(key: Any) -> bool:
+    return isinstance(key, str) and key.startswith(_DOC_KEY_PREFIXES)
+
+
+def _warn_unknown_config_keys(user: dict) -> None:
+    """Warn about unknown non-documentation keys in user config.
+
+    Documentation keys (`_comment*`, `_options*`, `_description*`) are
+    silently ignored. Unknown real keys print a warning (typo safety)
+    without failing, so forward-compatible configs keep working.
+    Nested generation.text/audio blocks are checked recursively, so a
+    typo like ``generation.text.local.modle_id`` warns instead of
+    silently doing nothing.
+    """
+    if not isinstance(user, dict):
+        return
+    for key, value in user.items():
+        if key in _KNOWN_CONFIG_KEYS or _is_doc_key(key):
+            if key in _KNOWN_CONFIG_KEYS and isinstance(value, dict):
+                known = _KNOWN_CONFIG_KEYS[key]
+                if isinstance(known, set):
+                    for sub in value:
+                        if (key == "generation" and sub in ("text", "audio")
+                                and isinstance(value[sub], dict)):
+                            _warn_unknown_nested(
+                                f"generation.{sub}", value[sub],
+                                _KNOWN_GENERATION_SUBKEYS[sub])
+                        elif sub not in known and not _is_doc_key(sub):
+                            print(
+                                f"[config] WARNING: unknown key "
+                                f"{key}.{sub}; ignored")
+            continue
+        print(f"[config] WARNING: unknown top-level key {key!r}; ignored")
+
+
+def _warn_unknown_nested(path: str, node: Any, known: Any) -> None:
+    """Recursively warn about unknown keys under a nested config block."""
+    if not isinstance(node, dict) or not isinstance(known, dict):
+        return
+    for sub, value in node.items():
+        if _is_doc_key(sub):
+            continue
+        if sub not in known:
+            print(f"[config] WARNING: unknown key {path}.{sub}; ignored")
+            continue
+        child_known = known[sub]
+        if isinstance(child_known, dict) and isinstance(value, dict):
+            _warn_unknown_nested(f"{path}.{sub}", value, child_known)
+        elif isinstance(child_known, set) and isinstance(value, dict):
+            for leaf in value:
+                if leaf not in child_known and not _is_doc_key(leaf):
+                    print(f"[config] WARNING: unknown key "
+                          f"{path}.{sub}.{leaf}; ignored")
+
+
+def validate_text_config(text_cfg: dict) -> None:
+    """Validate generation.text (raises ValueError on bad config).
+
+    - mode must be local|endpoint.
+    - local: provider + model_id required (files need NOT exist yet;
+      first actual use downloads them).
+    - endpoint: provider + base_url + model required.
+    - prompt files must exist with required placeholders.
+    """
+    from text_providers import TEXT_MODES
+    cfg = text_cfg if isinstance(text_cfg, dict) else {}
+    mode = str(cfg.get("mode", "endpoint") or "endpoint").strip().lower()
+    if mode not in TEXT_MODES:
+        raise ValueError(
+            f"generation.text.mode must be one of {list(TEXT_MODES)}, "
+            f"got {mode!r}")
+    if mode == "local":
+        local = cfg.get("local", {})
+        if not isinstance(local, dict):
+            raise ValueError("generation.text.local must be an object")
+        if not str(local.get("provider", "") or "").strip():
+            raise ValueError(
+                "generation.text.local.provider is required")
+        if not str(local.get("model_id", "") or "").strip():
+            raise ValueError(
+                "generation.text.local.model_id is required "
+                "(model files do NOT have to exist yet; they download "
+                "on first actual generate.py run)")
+    else:
+        endpoint = cfg.get("endpoint", {})
+        if not isinstance(endpoint, dict):
+            raise ValueError("generation.text.endpoint must be an object")
+        if not str(endpoint.get("provider", "") or "").strip():
+            raise ValueError(
+                "generation.text.endpoint.provider is required")
+        if not str(endpoint.get("base_url", "") or "").strip():
+            raise ValueError(
+                "generation.text.endpoint.base_url is required in "
+                "endpoint mode")
+        if not str(endpoint.get("model", "") or "").strip():
+            raise ValueError(
+                "generation.text.endpoint.model is required in "
+                "endpoint mode")
+    prompt = cfg.get("prompt", {})
+    if not isinstance(prompt, dict):
+        raise ValueError("generation.text.prompt must be an object")
+    system_file = str(prompt.get("system_file", "") or "")
+    user_file = str(prompt.get("user_file", "") or "")
+    if not system_file or not user_file:
+        raise ValueError(
+            "generation.text.prompt.system_file and user_file are required")
+    try:
+        validate_text_prompts(system_file, user_file)
+    except PromptError as exc:
+        raise ValueError(f"bad text prompt config: {exc}") from exc
+
+
+def validate_audio_config(audio_cfg: dict) -> None:
+    """Validate the fixed-source audio config (raises ValueError).
+
+    Audio has NO model/backend selection. The only valid shape is::
+
+        {"source": "cns11643", "preferred_voice": "auto"|"male"|"female"}
+
+    ``preferred_voice`` selects ONLY among same-reading CNS recordings
+    and only when source records carry voice metadata. Removed TTS
+    fields are rejected earlier by _check_deprecated_audio_config.
+    Missing/empty config means defaults (CNS source, auto voice).
+    """
+    cfg = audio_cfg if isinstance(audio_cfg, dict) else {}
+    source = str(cfg.get("source", CNS_SOURCE) or CNS_SOURCE).strip()
+    if source != CNS_SOURCE:
+        raise ValueError(
+            f"audio.source must be {CNS_SOURCE!r} (fixed human-recorded "
+            f"source; no TTS fallback), got {source!r}")
+    voice = str(cfg.get("preferred_voice", "auto") or "auto").strip()
+    if voice.lower() not in PREFERRED_VOICES:
+        raise ValueError(
+            f"audio.preferred_voice must be one of "
+            f"{list(PREFERRED_VOICES)}, got {voice!r}")
 
 
 # =============================================================================
@@ -352,6 +710,7 @@ DEFAULT_PROFILE_LABELS = {
     "structure": "Character structure",
     "stroke_order": "Stroke order",
     "examples": "Examples",
+    "notable_sayings": "Notable sayings",
     "other_readings_title": "Other readings (Unihan)",
     "table_pinyin": "Pinyin",
     "table_zhuyin": "Zhuyin",
@@ -700,14 +1059,17 @@ class UnihanIndex:
 
 
 # =============================================================================
-# CLEAN-v1: MOE audio resolver WITHOUT dictionary IDs (§7)
+# LEGACY/DEPRECATED: MOE-recording audio resolver — NOT used by clean-v1.
 # -----------------------------------------------------------------------------
-# Uses only: (a) metadata files shipped inside the audio package,
-# (b) original filename/path structure (exact char stem / char in path).
-# Word IDs (字詞號) are legacy and NEVER consulted here.
+# clean-v1 uses fixed CNS11643 human recordings (see cns_audio.py) because
+# MOE clips regularly speak more than the isolated target character. This
+# class (manifest + filename matching over word_wav/*.wav) is retained here
+# only for rollback comparison of old datasets. It has NO active-path
+# callers.
 # =============================================================================
 
 class CleanAudioResolver:
+    """DEPRECATED: MOE-recording resolver. Do not use in the clean path."""
     AUDIO_EXTS = {".wav", ".mp3", ".ogg", ".m4a"}
 
     def __init__(self, root: Path):
@@ -726,6 +1088,7 @@ class CleanAudioResolver:
             if len(stem) == 1 and is_cjk_char(stem):
                 self.char_index[stem].append(p)
         self.metadata_note = self._scan_metadata(root)
+        self.manifest_map, self.manifest_note = self._load_manifest(root)
         print(f"[audio] indexed {len(self.files):,} audio files (clean resolver, no dict IDs)")
 
     @staticmethod
@@ -738,9 +1101,92 @@ class CleanAudioResolver:
         return f"{len(metas)} metadata candidate(s): " + ", ".join(
             str(p.relative_to(root)) for p in metas[:10])
 
-    def resolve(self, char: str) -> tuple[Path | None, dict]:
+    def _load_manifest(self, root: Path) -> tuple[dict[str, list[Path]], str]:
+        """Parse the in-package filename manifest (字詞名 -> 檔案名稱).
+
+        The manifest filename is release-stamped, so it is discovered by
+        glob, never hardcoded. Joins on the character column only; the
+        字詞號 ID column is ignored. Returns ({}, note) when openpyxl is
+        missing or no usable manifest exists (caller falls back to
+        filename matching).
+        """
+        empty: dict[str, list[Path]] = {}
+        manifests = sorted(root.glob("*.xlsx"))
+        if not manifests:
+            return empty, "no manifest xlsx in audio package"
+        try:
+            from openpyxl import load_workbook as _load
+        except ImportError:
+            return empty, (
+                f"manifest present ({manifests[0].name}) but openpyxl "
+                "not installed; filename matching only"
+            )
+        by_name: dict[str, Path] = {}
+        for p in self.files:
+            by_name.setdefault(p.name, p)
+        manifest = manifests[0]
+        try:
+            wb = _load(manifest, read_only=True, data_only=True)
+            ws = wb[wb.sheetnames[0]]
+            header = None
+            char_col = file_col = -1
+            mapping: dict[str, list[Path]] = defaultdict(list)
+            rows = 0
+            for row in ws.iter_rows(min_row=1, max_row=8, values_only=True):
+                cells = [nfc(c) for c in (row or [])]
+                if "字詞名" in cells and "檔案名稱" in cells:
+                    header = cells
+                    char_col = cells.index("字詞名")
+                    file_col = cells.index("檔案名稱")
+                    break
+            if header is None:
+                wb.close()
+                return empty, f"manifest {manifest.name}: no 字詞名/檔案名稱 header"
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if not row:
+                    continue
+                char = nfc(row[char_col]) if char_col < len(row) else ""
+                fn = nfc(row[file_col]) if file_col < len(row) else ""
+                if len(char) != 1 or not fn:
+                    continue
+                target = by_name.get(fn)
+                if target is None:
+                    continue
+                if target not in mapping[char]:
+                    mapping[char].append(target)
+                rows += 1
+            wb.close()
+        except Exception as exc:
+            return empty, f"manifest {manifest.name}: unreadable ({exc})"
+        note = f"{manifest.name}: {rows} rows, {len(mapping)} chars"
+        print(f"[audio] manifest {note}")
+        return dict(mapping), note
+
+    def resolve_all(self, char: str) -> tuple[list[Path], dict]:
+        """Resolve ALL candidate audio files for a character.
+
+        Returns (paths, info) with paths in deterministic (filename-sorted)
+        order:
+          - manifest hits (any count) -> score 100, all preserved. Multiple
+            hits are NOT discarded: the package carries no per-file
+            pronunciation metadata, so no single file can be proven to match
+            the card's reading and picking one would be guessing.
+          - single filename hit (stem==char 95 / char-in-path 80) -> as before.
+          - nothing -> ([], no_match info).
+        Callers decide presentation: 1 file = resolved, N files = multiple
+        (all preserved, unlabeled), 0 files = unresolved.
+        """
         if not self.files:
-            return None, {"reason": "no_audio_files"}
+            return [], {"reason": "no_audio_files"}
+        hits = sorted(self.manifest_map.get(char, []), key=lambda p: p.name)
+        if hits:
+            return hits, {
+                "reason": "matched" if len(hits) == 1 else "multiple",
+                "score": 100,
+                "match_reasons": ["manifest:字詞名->檔案名稱"],
+                "source_paths": [str(p.relative_to(self.root)) for p in hits],
+                "manifest": self.manifest_note,
+            }
         scored: list[tuple[int, Path, list[str]]] = []
         for path in self.files:
             rel = self.search_text[path]
@@ -752,13 +1198,13 @@ class CleanAudioResolver:
             if score:
                 scored.append((score, path, reasons))
         if not scored:
-            return None, {"reason": "no_match", "char": char,
-                          "metadata": self.metadata_note}
+            return [], {"reason": "no_match", "char": char,
+                        "metadata": self.metadata_note}
         scored.sort(key=lambda x: (-x[0], str(x[1])))
         best_score = scored[0][0]
         best = [x for x in scored if x[0] == best_score]
         if best_score < 80 or len(best) != 1:
-            return None, {
+            return [], {
                 "reason": "ambiguous_or_low_confidence",
                 "best_score": best_score,
                 "candidates": [
@@ -766,12 +1212,21 @@ class CleanAudioResolver:
                      "score": x[0], "reasons": x[2]} for x in best[:10]
                 ],
             }
-        return best[0][1], {
+        return [best[0][1]], {
             "reason": "matched",
             "score": best[0][0],
             "match_reasons": best[0][2],
             "source_path": str(best[0][1].relative_to(self.root)),
         }
+
+    def resolve(self, char: str) -> tuple[Path | None, dict]:
+        """Backward-compatible single-file resolution (first candidate)."""
+        paths, info = self.resolve_all(char)
+        if not paths:
+            return None, info
+        single = dict(info)
+        single["source_path"] = str(paths[0].relative_to(self.root))
+        return paths[0], single
 
 
 # =============================================================================
@@ -1380,7 +1835,8 @@ class StrokeIndex:
 
 # =============================================================================
 # LEGACY: AudioResolver (used MOE dict 字詞號; NOT used by clean-v1 —
-# see CleanAudioResolver above)
+# like CleanAudioResolver above, which is also legacy since CNS11643
+# human recordings replaced MOE recordings)
 # =============================================================================
 
 class AudioResolver:
@@ -1689,26 +2145,55 @@ class Grounder:
 # =============================================================================
 
 class LLMClient:
-    def __init__(
-        self,
-        base_url: str,
-        model: str,
-        timeout: int = 180,
-    ):
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.timeout = timeout
+    """File-prompt text enricher over a config-driven text backend.
 
-        # User previously needed trust_env=False because local requests were
-        # accidentally routed through an environment proxy.
-        self.session = requests.Session()
-        self.session.trust_env = False
+    Renders config/prompts/text_system.txt + text_user.txt (never
+    hardcoded prompt strings) and completes them via generation.text
+    mode local|endpoint (see text_providers.py). Endpoint mode preserves
+    the previous llama.cpp OpenAI-compatible behavior; local mode uses a
+    lazily-loaded Hugging Face model (first actual use downloads missing
+    files into the HF cache, later runs reuse them).
+    """
+
+    def __init__(self, text_cfg: dict):
+        cfg = dict(text_cfg or {})
+        prompt = cfg.get("prompt", {})
+        if not isinstance(prompt, dict):
+            prompt = {}
+        self.system_file = str(
+            prompt.get("system_file", DEFAULT_SYSTEM_FILE)
+            or DEFAULT_SYSTEM_FILE)
+        self.user_file = str(
+            prompt.get("user_file", DEFAULT_USER_FILE)
+            or DEFAULT_USER_FILE)
+        try:
+            validate_text_prompts(self.system_file, self.user_file)
+        except PromptError as exc:
+            raise ValueError(f"bad text prompt config: {exc}") from exc
+        try:
+            self.provider = build_text_provider(cfg)
+        except TextProviderError as exc:
+            raise ValueError(f"bad generation.text config: {exc}") from exc
+        self.text_cfg = cfg
+        # Back-compat aliases (previous constructor took base_url/model).
+        desc = self.provider.describe()
+        self.model = desc.get("model", "") or desc.get("model_id", "")
+        self.base_url = ""
+        if desc.get("mode") == "endpoint":
+            endpoint = cfg.get("endpoint", {})
+            if isinstance(endpoint, dict):
+                self.base_url = str(endpoint.get("base_url", "") or "")
 
     @property
     def chat_url(self) -> str:
-        if self.base_url.endswith("/v1"):
-            return self.base_url + "/chat/completions"
-        return self.base_url + "/v1/chat/completions"
+        chat = getattr(self.provider, "chat_url", "")
+        if chat:
+            return chat
+        return ""
+
+    @property
+    def provider_desc(self) -> dict:
+        return self.provider.describe()
 
     def enrich(
         self,
@@ -1717,6 +2202,7 @@ class LLMClient:
         profile: dict,
         *,
         refresh: bool,
+        max_sayings: int = 2,
     ) -> dict:
         profile_code = str(profile.get("language_code", "vi") or "vi")
         language_name = str(profile.get("language_name", profile_code)
@@ -1734,21 +2220,24 @@ class LLMClient:
             / f"U+{grounding.ucs}.json"
         )
 
-        input_hash = sha256_text(
-            PROMPT_VERSION
-            + "\n"
-            + self.model
-            + "\n"
-            + profile_code
-            + "\n"
-            + profile_instruction
-            + "\n"
-            + json.dumps(
-                facts,
-                ensure_ascii=False,
-                sort_keys=True,
-            )
-        )
+        facts_canonical = json.dumps(
+            facts, ensure_ascii=False, sort_keys=True)
+        facts_json = json.dumps(
+            facts, ensure_ascii=False, indent=2)
+        system_prompt = render_system(
+            self.system_file, language_name=language_name,
+            profile_instruction=profile_instruction,
+            max_sayings=max_sayings, target_char=grounding.char)
+        user_prompt = render_user(self.user_file, facts_json=facts_json)
+        system_hash = prompt_file_hash(self.system_file)
+        user_hash = prompt_file_hash(self.user_file)
+        desc = self.provider.describe()
+
+        input_hash = text_cache_identity(
+            provider_desc=desc, system_hash=system_hash,
+            user_hash=user_hash, profile_code=profile_code,
+            profile_instruction=profile_instruction,
+            facts_canonical=facts_canonical)
 
         if cache_path.exists() and not refresh:
             cached = read_json(cache_path)
@@ -1761,118 +2250,33 @@ class LLMClient:
                 )
                 return cached["result"]
 
-        system_prompt = f"""
-You are creating Traditional Chinese learner content for a learner whose
-destination language is {language_name}.
+        print(f"[llm] {grounding.char} -> mode={desc.get('mode')} "
+              f"provider={desc.get('provider')}")
 
-The data in SOURCE_FACTS is ground truth from Unicode Unihan (romanization,
-radical, stroke count, variants, English definition). Do not modify these
-facts and do not derive Zhuyin yourself.
-
-Profile instruction:
-{profile_instruction}
-
-Mandatory rules:
-1. Always use TAIWAN Traditional Chinese in example sentences.
-2. "meaning" must be a natural, short, useful gloss in the destination
-   language, grounded in the unicode_definition_en provided.
-3. "structure_explanation" may only describe a memory-level breakdown for
-   learners (AI enrichment, NOT authoritative IDS data). Do not invent
-   historical etymology. If the data is insufficient, briefly say so
-   instead of concluding.
-4. "components_generated" are AI-suggested memory components, not
-   authoritative CHISE/Unicode data. "component_meanings" only glosses
-   those components in the destination language.
-5. "han_viet_suggestion": optionally suggest a Sino-Vietnamese-style
-   reading aid for the learner; this is an AI value, never an official
-   reading. Leave it empty when it adds no value for this destination
-   language.
-6. Create 2 natural example sentences at level A2-B1, preferring usage
-   common in Taiwan. Each example must have:
-   - zh: Traditional Chinese
-   - pinyin: Hanyu Pinyin with tone marks
-   - translation: natural translation in the destination language
-7. Return valid JSON only. No Markdown, no explanation outside JSON.
-
-Schema:
-{{
-  "meaning": "...",
-  "han_viet_suggestion": "...",
-  "structure_explanation": "...",
-  "components_generated": ["...", "..."],
-  "component_meanings": {{
-    "心": "...",
-    "田": "..."
-  }},
-  "examples": [
-    {{"zh": "...", "pinyin": "...", "translation": "..."}},
-    {{"zh": "...", "pinyin": "...", "translation": "..."}}
-  ]
-}}
-""".strip()
-
-        user_prompt = (
-            "SOURCE_FACTS:\n"
-            + json.dumps(
-                facts,
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
-
-        payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                },
-            ],
-            "temperature": 0.2,
-            "max_tokens": 900,
-            "response_format": {
-                "type": "json_object",
-            },
-        }
-
-        print(
-            f"[llm] {grounding.char} -> {self.chat_url}"
-        )
-
-        response = self.session.post(
-            self.chat_url,
-            json=payload,
-            timeout=self.timeout,
-        )
-
-        # Some llama.cpp builds may reject response_format.
-        if response.status_code >= 400:
-            payload.pop("response_format", None)
-            response = self.session.post(
-                self.chat_url,
-                json=payload,
-                timeout=self.timeout,
-            )
-
-        response.raise_for_status()
-
-        raw = response.json()
-        content = (
-            raw["choices"][0]["message"]["content"]
-        )
+        try:
+            content = self.provider.complete(
+                system_prompt=system_prompt, user_prompt=user_prompt)
+        except (TextProviderError, PromptError) as exc:
+            raise RuntimeError(f"text generation failed: {exc}") from exc
 
         result = json_from_model_text(content)
-        result = self._validate_result(result)
+        result = self._validate_result(
+            result, char=grounding.char, max_sayings=max_sayings)
 
         write_json(
             cache_path,
             {
                 "prompt_version": PROMPT_VERSION,
                 "input_hash": input_hash,
+                # Provenance for cache debugging (no secrets, no URLs,
+                # no absolute paths — model alias / repo id only).
+                "text_mode": desc.get("mode", ""),
+                "text_provider": desc.get("provider", ""),
+                "text_model": desc.get("model", "")
+                or desc.get("model_id", ""),
+                "text_model_revision": desc.get("revision", ""),
+                "prompt_system_hash": system_hash,
+                "prompt_user_hash": user_hash,
                 "target_language": profile_code,
                 "facts": facts,
                 "result": result,
@@ -1882,7 +2286,8 @@ Schema:
         return result
 
     @staticmethod
-    def _validate_result(result: dict) -> dict:
+    def _validate_result(result: dict, *, char: str = "",
+                         max_sayings: int = 2) -> dict:
         # Canonical language-neutral keys. Legacy suffixed keys
         # (meaning_vi, structure_explanation_vi, component_meanings_vi,
         # examples[].vi, han_viet_generated) are accepted and migrated so
@@ -1938,7 +2343,56 @@ Schema:
                 if nfc(k)
             },
             "examples": valid_examples,
+            "notable_sayings": _validate_sayings(
+                result.get("notable_sayings", []),
+                char=char, max_items=max_sayings),
         }
+
+
+SAYING_TYPES = {
+    "quotation", "proverb", "idiom", "maxim", "classical", "other",
+}
+
+
+def _validate_sayings(raw: Any, *, char: str = "",
+                      max_items: int = 2) -> list[dict]:
+    """Validate LLM-generated notable sayings (enrichment, never facts).
+
+    Keeps at most max_items complete items. An item survives only with
+    non-empty traditional/pinyin/translation; the traditional text must
+    contain the target character (quality over coverage: unrelated quotes
+    are dropped, never backfilled). Unknown type labels become "other";
+    source may be "" (unknown attribution). han_viet stays nested under
+    language_specific so non-Vietnamese profiles never carry it.
+    """
+    if not isinstance(raw, list) or max_items <= 0:
+        return []
+    valid = []
+    for item in raw[:max_items]:
+        if not isinstance(item, dict):
+            continue
+        traditional = nfc(item.get("traditional"))
+        py = nfc(item.get("pinyin"))
+        tr = nfc(item.get("translation"))
+        if not (traditional and py and tr):
+            continue
+        if char and char not in traditional:
+            continue
+        kind = nfc(item.get("type")).lower()
+        if kind not in SAYING_TYPES:
+            kind = "other"
+        lang = item.get("language_specific", {})
+        han_viet = nfc((lang or {}).get("han_viet")) \
+            if isinstance(lang, dict) else ""
+        valid.append({
+            "traditional": traditional,
+            "pinyin": py,
+            "translation": tr,
+            "type": kind,
+            "source": nfc(item.get("source")),
+            "language_specific": {"han_viet": han_viet},
+        })
+    return valid
 
 
 # =============================================================================
@@ -2128,6 +2582,28 @@ PLAYER_JS = r"""
         );
     };
 
+    // Step back exactly one stroke. The MOE engine has no native
+    // step-backward API, so: take manual control (same stop as moePause),
+    // read the committed-stroke count (single source of truth, no parallel
+    // state), reset, then statically re-commit the first target strokes
+    // through the same nextStroke() playback uses. Never animates, so a
+    // paused card stays paused; an in-flight animation is cancelled first.
+    // At the beginning (order 0) the target clamps to 0: no-op, no error.
+    window.moePrev = function () {
+        if (!window.moeDemo || !window.moePanel) return;
+
+        window.moeDemo.pause();
+        window.moeDemo.isPauseAfterDraw = false;
+
+        var order = window.moePanel.getCurrentStrokeIndex();
+        var target = Math.max(0, order - 1);
+
+        window.moePanel.reset();
+        for (var i = 0; i < target; i++) {
+            window.moePanel.nextStroke();
+        }
+    };
+
     setTimeout(initMoeStroke, 0);
 })();
 </script>
@@ -2142,14 +2618,21 @@ PLAYER_JS = r"""
 # =============================================================================
 
 def clean_readings_html(pinyin_alternates: list, labels: dict | None = None) -> str:
-    """Alternate kMandarin readings (Unihan factual, non-primary)."""
+    """Alternate kMandarin readings (Unihan factual, non-primary).
+
+    Zhuyin is derived with the SAME deterministic pinyin_to_zhuyin()
+    converter as the main card (tones preserved; "" on failure renders
+    as "—"). Hán-Việt stays "—": kVietnamese is per-character, not
+    per-reading, and copying the character's single Hán-Việt value into
+    every alternate row would misattribute it.
+    """
     labels = labels or DEFAULT_PROFILE_LABELS
     if not pinyin_alternates:
         return ""
     rows = "".join(
         "<tr>"
         f"<td>{escape(p) or '—'}</td>"
-        "<td>—</td><td>—</td>"
+        f"<td>{escape(pinyin_to_zhuyin(p)) or '—'}</td><td>—</td>"
         f"<td>{escape(labels.get('alternate_reading_note', ''))}</td>"
         "</tr>"
         for p in pinyin_alternates
@@ -2169,8 +2652,18 @@ def clean_readings_html(pinyin_alternates: list, labels: dict | None = None) -> 
     )
 
 
-def clean_components_html(enrichment: dict, labels: dict | None = None) -> str:
-    """LLM-suggested learning components — AI enrichment, NOT IDS."""
+def clean_components_html(enrichment: dict, labels: dict | None = None, *,
+                          unihan: "UnihanIndex | None" = None,
+                          show_han_viet: bool = False) -> str:
+    """LLM-suggested learning components — AI enrichment, NOT IDS.
+
+    Component SELECTION and glosses are AI-generated (see disclaimer).
+    Pinyin / Hán-Việt are factual Unihan data resolved with the SAME
+    UnihanIndex backing the main card (first kMandarin token /
+    kVietnamese), never LLM output. "—" appears only when the token is
+    not a single resolvable CJK character, Unihan has no value, or the
+    profile opts out of Hán-Việt.
+    """
     labels = labels or DEFAULT_PROFILE_LABELS
     components = enrichment.get("components_generated", [])
     meanings = enrichment.get("component_meanings",
@@ -2181,12 +2674,21 @@ def clean_components_html(enrichment: dict, labels: dict | None = None) -> str:
         return f'<div class="muted">{escape(labels.get("no_components", ""))}.</div>'
     rows = []
     for token in components:
+        pinyin = ""
+        han_viet = ""
+        token_n = nfc(token)
+        if len(token_n) == 1 and is_cjk_char(token_n) and unihan is not None:
+            facts = unihan.get(token_n)
+            if facts is not None:
+                pinyin = facts.pinyin
+                if show_han_viet:
+                    han_viet = facts.vietnamese
         rows.append(
             "<tr>"
             f'<td class="component-char">{escape(token)}</td>'
             f"<td>{escape(labels.get('component_role_ai', ''))}</td>"
-            "<td>—</td>"
-            "<td>—</td>"
+            f"<td>{escape(pinyin) or '—'}</td>"
+            f"<td>{escape(han_viet) or '—'}</td>"
             f"<td>{escape(meanings.get(token, '')) or '—'}</td>"
             "</tr>"
         )
@@ -2322,6 +2824,54 @@ def examples_html(examples: list[dict], labels: dict | None = None) -> str:
     return "".join(blocks)
 
 
+def notable_sayings_html(items: list[dict], labels: dict | None = None,
+                         show_han_viet: bool = False) -> str:
+    """Render the optional notable-sayings block (reuses example styling).
+
+    Returns "" when there are no items, so the template shows no heading
+    or container at all. The section title lives here (not in the
+    template) for exactly that reason. Per-item Hán–Việt renders only for
+    opted-in profiles; source/type render as a muted line when known.
+    """
+    labels = labels or DEFAULT_PROFILE_LABELS
+    if not items:
+        return ""
+    blocks = [
+        f'<div class="section-title">'
+        f'{escape(labels.get("notable_sayings", ""))}</div>'
+    ]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        traditional = nfc(item.get("traditional"))
+        if not traditional:
+            continue
+        parts = [
+            '<div class="example">',
+            f'<div class="example-zh">{escape(traditional)}</div>',
+            f'<div class="example-pinyin">'
+            f'{escape(item.get("pinyin"))}</div>',
+        ]
+        han_viet = nfc((item.get("language_specific") or {}).get("han_viet")) \
+            if isinstance(item.get("language_specific"), dict) else ""
+        if show_han_viet and han_viet:
+            parts.append(
+                f'<div class="example-pinyin">{escape(han_viet)}</div>')
+        parts.append(
+            '<div class="example-translation">'
+            f'{escape(item.get("translation"))}</div>')
+        kind = nfc(item.get("type"))
+        source = nfc(item.get("source"))
+        credit = " · ".join(p for p in (kind, source) if p)
+        if credit:
+            parts.append(f'<div class="muted">{escape(credit)}</div>')
+        parts.append("</div>")
+        blocks.append("".join(parts))
+    if len(blocks) == 1:
+        return ""
+    return "".join(blocks)
+
+
 # =============================================================================
 # Build normalized card records (clean-v1, provenance-explicit §10)
 # =============================================================================
@@ -2335,9 +2885,7 @@ def _enrichment_entry(value: Any, llm_model: str | None,
 def build_card_record(
     grounding: CleanGrounding,
     enrichment: dict,
-    audio_info: dict,
-    audio_filename: str,
-    audio_sha256: str,
+    audio: dict,
     stroke_sha256: str,
     llm_model: str | None,
     generation_mode: str,
@@ -2351,6 +2899,11 @@ def build_card_record(
     if not hanviet_value and enrichment.get("han_viet_suggestion"):
         hanviet_value = enrichment["han_viet_suggestion"]
         hanviet_source = "llm_generated"
+    # media.audio arrives fully built (see build_cns_audio_block): the
+    # fixed CNS11643 contract is one human recording per character+reading,
+    # with honest source/checksum provenance. No synthesis concepts remain.
+    if not isinstance(audio, dict):
+        audio = {}
     return {
         "schema": CLEAN_SCHEMA_VERSION,
         "char": grounding.char,
@@ -2399,6 +2952,9 @@ def build_card_record(
                 enrichment.get("component_meanings", {}), llm_model),
             "examples": _enrichment_entry(
                 enrichment.get("examples", []), llm_model),
+            "notable_sayings": _enrichment_entry(
+                enrichment.get("notable_sayings", []), llm_model,
+                "llm (learner-facing enrichment, never reference facts)"),
         },
         "media": {
             "stroke": {
@@ -2408,15 +2964,52 @@ def build_card_record(
                 "sha256": stroke_sha256,
                 "transform": "none: original bytes base64-encoded",
             },
-            "audio": {
-                "source": "moe_taiwan",
-                "filename": audio_filename,
-                "sha256": audio_sha256,
-                "match": audio_info,
-                "transform": "none: original bytes copied",
-            },
+            "audio": audio,
         },
         "generation_mode": generation_mode,
+    }
+
+
+def build_cns_audio_block(*, status: str, filename: str = "",
+                          sha256: str = "", pronunciation: dict | None = None,
+                          expected_pinyin: str = "",
+                          expected_zhuyin: str = "",
+                          matched_zhuyin: str = "",
+                          record_id: str = "", voice: str = "",
+                          relpath: str = "",
+                          reading_ambiguity: bool = False,
+                          detail: dict | None = None,
+                          ) -> dict:
+    """Build the normalized media.audio block for CNS11643 audio.
+
+    status is "matched" (exact CNS recording for character + expected
+    Zhuyin, human-recorded, reading verified by construction) or
+    "unavailable" (no CNS index, or no exact reading match — card gets
+    no audio, never synthesized, never substituted).
+    """
+    pronunciation = dict(pronunciation or {})
+    return {
+        "source": "cns11643" if status == "matched" else "unavailable",
+        "status": status,
+        "human_recorded": status == "matched",
+        "file": filename,
+        "filename": filename,
+        "sha256": sha256,
+        "pronunciation": {
+            "character": pronunciation.get("character", ""),
+            "pinyin": pronunciation.get("pinyin", ""),
+            "zhuyin": pronunciation.get("zhuyin", ""),
+        },
+        "expected_pinyin": expected_pinyin,
+        "expected_zhuyin": expected_zhuyin,
+        "matched_zhuyin": matched_zhuyin,
+        "record_id": record_id,
+        "voice": voice,
+        "relpath": relpath,
+        "reading_ambiguity": reading_ambiguity,
+        "reading_verified": status == "matched",
+        "transform": "none: original CNS bytes copied without transcoding",
+        "detail": detail or {},
     }
 
 
@@ -2428,7 +3021,9 @@ def build_card_record(
 # %%LABEL_*%% tokens from the active profile and appends PLAYER_JS.
 # Field ORDER in model.json is frozen for Anki backward compatibility
 # (notes match by GUID, values map positionally). ANKI_MODEL_ID/ANKI_DECK_ID
-# and guid_for("MOE-TRADITIONAL-V1", char) are unchanged.
+# and guid_for("MOE-TRADITIONAL-V1", char) are unchanged. New fields may
+# only be APPENDED (existing notes then see them empty); never reorder,
+# remove, or insert mid-list.
 # =============================================================================
 
 # Fallback copies used only if config/anki/* is missing; the files on disk
@@ -2438,7 +3033,7 @@ _FALLBACK_ANKI_FIELDS = [
     "Hanzi", "Zhuyin", "Pinyin", "HanViet", "Meaning", "DefinitionEN",
     "Variants", "StructureExplanation", "ComponentsHTML",
     "OtherReadingsHTML", "StrokeDataB64", "Audio", "ExamplesHTML",
-    "SourceNote",
+    "SourceNote", "NotableSayingsHTML",
 ]
 
 _ANKI_LABEL_TOKENS = (
@@ -2553,18 +3148,38 @@ def prepare_support_media() -> list[Path]:
     return result
 
 
-def copy_audio_for_anki(
+def copy_cns_audio_for_anki(
     source: Path,
     ucs: str,
-    index: int = 1,
+    zhuyin_norm: str,
 ) -> Path:
+    """Copy an ORIGINAL CNS recording into build media, unchanged.
+
+    Deterministic name: cns_U<UCS>_<zhuyin8>.<ext> (no transcoding).
+    """
     ext = source.suffix.lower()
     dest = (
         BUILD_MEDIA
-        / f"moe_audio_U{ucs}_{index}{ext}"
+        / f"cns_U{ucs}_{zhuyin_slug(zhuyin_norm)}{ext}"
     )
     shutil.copy2(source, dest)
     return dest
+
+
+def load_cns_resolver() -> CharacterAudioResolver | None:
+    """Create the CNS resolver once per run (index loads once).
+
+    Returns None with a clear warning when the CNS dataset/index is
+    absent or malformed: cards then generate without audio.
+    """
+    try:
+        resolver = CharacterAudioResolver.load(CNS_INDEX_PATH)
+    except CnsError as exc:
+        print(f"[cns] WARNING: {exc}")
+        return None
+    print(f"[cns] index: {resolver.record_count} recordings "
+          f"({CNS_INDEX_PATH})")
+    return resolver
 
 
 # =============================================================================
@@ -2601,9 +3216,11 @@ def publish_reference(
     generation_mode: str,
     llm_model: str | None,
     audio_missing: list,
+    audio_info: dict,
     generation_errors: list,
     publish_dir: Path,
     target_language: str = "vi",
+    text_info: dict | None = None,
 ) -> Path:
     """Copy normalized records + original media into reference-v1 + manifest.
 
@@ -2678,24 +3295,36 @@ def publish_reference(
         else:
             missing_strokes.append(char)
 
-    # Audio: copy original packaged bytes referenced by card records.
+    # Audio: copy the single CNS recording referenced by each card
+    # record. Published with its hash so the manifest covers every file.
     for char in chars:
         ucs = f"{ord(char):04X}"
         rec_path = char_dir / f"U+{ucs}.json"
         if not rec_path.exists():
             continue
         rec = json.loads(rec_path.read_text(encoding="utf-8"))
-        fname = ((rec.get("media") or {}).get("audio") or {}).get("filename", "")
-        if not fname:
-            continue
-        src_media = BUILD_MEDIA / fname
-        if src_media.exists():
+        audio_block = (rec.get("media") or {}).get("audio") or {}
+        fnames = []
+        for key in ("file", "filename"):
+            if audio_block.get(key) and audio_block[key] not in fnames:
+                fnames.append(audio_block[key])
+        for cand in audio_block.get("candidates", []) or []:
+            if isinstance(cand, dict) and cand.get("file"):
+                if cand["file"] not in fnames:
+                    fnames.append(cand["file"])
+        for fname in fnames:
+            if not fname:
+                continue
+            src_media = BUILD_MEDIA / fname
+            if not src_media.exists():
+                continue
             dst = audio_dir / fname
             if not dst.exists():
                 shutil.copy2(src_media, dst)
             published_files[f"audio/{fname}"] = sha256_file(dst)
 
     complete = generation_mode == "official" and not generation_errors
+    text_info = dict(text_info or {})
     manifest = {
         "schema_version": CLEAN_SCHEMA_VERSION,
         "dataset_version": REFERENCE_DATASET_VERSION,
@@ -2709,11 +3338,31 @@ def publish_reference(
         "prompt_version": PROMPT_VERSION,
         # Model ALIAS only — never the private endpoint URL.
         "llm_model": llm_model,
+        # Text provenance WITHOUT machine-specific config: mode +
+        # provider + model alias/repo id (+ revision) only. Endpoint
+        # URLs, API keys, and absolute model-cache paths MUST NOT
+        # appear here (the validator checks).
+        "text": {
+            "mode": text_info.get("mode", ""),
+            "provider": text_info.get("provider", ""),
+            "model": text_info.get("model", ""),
+            "model_revision": text_info.get("model_revision", ""),
+        },
+        # CNS11643 fixed-source provenance: source + voice preference
+        # + index size. No models, no endpoints, no machine-specific
+        # paths (the validator checks).
+        "audio": {
+            "source": audio_info.get("source", CNS_SOURCE),
+            "preferred_voice": audio_info.get("preferred_voice", "auto"),
+            "index_records": audio_info.get("index_records", 0),
+        },
         "files": published_files,
         "counts": {
             "requested": len(chars),
             "errors": len(generation_errors),
             "audio_missing": len(audio_missing),
+            "audio_matched": len(chars) - len(audio_missing) - len(
+                generation_errors),
             "missing_strokes": missing_strokes,
             "missing_audio_chars": missing_audio,
         },
@@ -2735,13 +3384,16 @@ def publish_reference(
         encoding="utf-8",
     )
     (license_dir / "ATTRIBUTION.txt").write_text(
-        "Stroke-order geometry + pronunciation audio: "
+        "Stroke-order geometry: "
         "中華民國教育部 (MOE Taiwan).\n"
         "Factual text (readings/radicals/strokes/variants/English "
         "definitions): Unicode Unihan "
         f"{UNICODE_VERSION} (https://www.unicode.org/license.html).\n"
-        "Learner-language glosses, structure notes, examples: "
-        "AI-generated, for learning reference only.\n",
+        "Pronunciation audio: human-recorded CNS11643 / 全字庫 "
+        "(see manifest 'audio' section); NOT synthesized, NOT MOE "
+        "recordings.\n"
+        "Learner-language glosses, structure notes, examples, notable "
+        "sayings: AI-generated, for learning reference only.\n",
         encoding="utf-8",
     )
     return manifest_path
@@ -2769,26 +3421,83 @@ def select_characters(
     args,
     config: dict,
 ) -> tuple[list[str], str]:
-    """TEST mode returns EXACTLY [config test_character].
+    """Select characters to generate.
 
-    Not `limit=1` after arbitrary ordering: the character comes from config
-    (CLI --test-char overrides). OFFICIAL mode returns the full supported
-    set (explicit --chars/--limit still work as debug overrides).
+    Precedence (highest first):
+      1. ``--chars``: raw character string, debug override (deduped,
+         order-preserving; unsupported chars fail at grounding time).
+      2. ``--test-chars``: comma/space-separated list, debug override
+         (entries validated, duplicates rejected, any length >= 1).
+      3. TEST mode (default): exactly ``config["test_characters"]`` —
+         never ``limit=N`` over dataset order. Entries are validated
+         (single character, no duplicates), config order is preserved,
+         and every entry must exist in the supported stroke dataset.
+      4. OFFICIAL mode: the full supported set (``--limit`` still works
+         as a debug cap).
+
+    OFFICIAL mode returns the full supported set. The legacy singular
+    ``test_character`` config key and ``--test-char`` flag no longer exist:
+    passing ``--test-char`` fails loudly (unrecognized argument), and a
+    stale ``test_character`` key in config raises a migration error.
     """
     if args.chars:
         return parse_chars_arg(args.chars), "debug --chars override"
+    if args.test_chars:
+        return (
+            _validate_test_list(
+                re.split(r"[,\s]+", args.test_chars.strip()),
+                source="--test-chars",
+                exact_count=None,
+            ),
+            "debug --test-chars override",
+        )
     mode = (args.mode or config.get("mode", "test")).lower()
     if mode == "official":
         chars = list(stroke_index.ordered_chars)
         if args.limit > 0:
             chars = chars[:args.limit]
         return chars, "official"
-    test_char = args.test_char or config.get("test_character", "思")
-    test_char = nfc(test_char)
-    if len(test_char) != 1:
+    if "test_character" in config:
         raise ValueError(
-            f"Test mode needs exactly one character, got {test_char!r}")
-    return [test_char], "test"
+            "Config key 'test_character' was replaced by 'test_characters' "
+            "(a list). Rename it, e.g. \"test_characters\": [\"思\", ...].")
+    chars = _validate_test_list(
+        config.get("test_characters", DEFAULT_TEST_CHARACTERS),
+        source="config test_characters",
+        exact_count=len(DEFAULT_TEST_CHARACTERS),
+    )
+    missing = [c for c in chars if stroke_index.get(c) is None]
+    if missing:
+        raise ValueError(
+            "TEST characters not in the supported stroke dataset: "
+            + ", ".join(f"{c} (U+{ord(c):04X})" for c in missing)
+            + ". Edit config test_characters.")
+    return chars, "test"
+
+
+def _validate_test_list(raw: Any, *, source: str,
+                        exact_count: int | None) -> list[str]:
+    """Validate an explicit test-character list, preserving order."""
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(
+            f"{source} must be a non-empty list of characters")
+    chars = [nfc(c) for c in raw if nfc(c)]
+    if len(chars) != len(raw):
+        raise ValueError(f"{source} contains empty entries")
+    if any(len(c) != 1 for c in chars):
+        bad = [c for c in chars if len(c) != 1]
+        raise ValueError(
+            f"{source} must hold exactly one character per entry, "
+            f"got {bad!r}")
+    seen: set[str] = set()
+    dupes = sorted({c for c in chars if c in seen or seen.add(c)})
+    if dupes:
+        raise ValueError(f"{source} contains duplicates: {dupes!r}")
+    if exact_count is not None and len(chars) != exact_count:
+        raise ValueError(
+            f"{source} must hold exactly {exact_count} characters, "
+            f"got {len(chars)}")
+    return chars
 
 
 # =============================================================================
@@ -2823,9 +3532,11 @@ def main() -> None:
         help="Generation mode. Default: read from config/config.local.json (test).",
     )
     parser.add_argument(
-        "--test-char",
+        "--test-chars",
         default="",
-        help="Debug override for the single test character.",
+        help="Debug override for the test set, e.g. --test-chars 思,八,乾. "
+        "Validated like config test_characters but any length >= 1. "
+        "Normal TEST runs should use config instead.",
     )
 
     parser.add_argument(
@@ -2880,38 +3591,103 @@ def main() -> None:
     show_han_viet = bool((profile.get("features") or {}).get(
         "show_han_viet", target_language == "vi"))
 
-    llm_base_url = args.llm_base_url or config["llm"]["base_url"]
-    llm_model = args.llm_model or config["llm"]["model"]
-    llm_timeout = int(config["llm"].get("timeout_seconds", 180))
     deck_name = args.deck_name or config["generation"]["deck_name"]
     output_default = config["generation"]["output"]
 
+    # ---- Text backend (generation.text: mode local|endpoint) ----
+    text_cfg = config["generation"].get("text", {})
+    if not isinstance(text_cfg, dict):
+        text_cfg = {}
+    # Debug overrides keep working: they target the endpoint block and
+    # force endpoint mode for this run (previous CLI behavior).
+    if args.llm_base_url or args.llm_model:
+        text_cfg = {**text_cfg, "mode": "endpoint"}
+        endpoint_override = dict(text_cfg.get("endpoint", {}))
+        if args.llm_base_url:
+            endpoint_override["base_url"] = args.llm_base_url
+        if args.llm_model:
+            endpoint_override["model"] = args.llm_model
+        text_cfg["endpoint"] = endpoint_override
+    # Legacy top-level llm.* flags stay readable for old scripts.
+    if not args.llm_base_url and config.get("llm", {}).get("base_url"):
+        pass  # already migrated into text.endpoint by the loader
+    try:
+        validate_text_config(text_cfg)
+    except ValueError as exc:
+        raise SystemExit(f"Bad text config: {exc}")
+
+    # ---- Audio: fixed CNS11643 source (no model/backend selection) ----
+    audio_cfg = config.get("audio", {})
+    if not isinstance(audio_cfg, dict):
+        audio_cfg = {}
+    try:
+        validate_audio_config(audio_cfg)
+    except ValueError as exc:
+        raise SystemExit(f"Bad audio config: {exc}")
+    preferred_voice = str(
+        audio_cfg.get("preferred_voice", "auto") or "auto").strip().lower()
+
     ensure_dirs()
 
+    # Windows consoles (cp1252) crash printing CJK progress lines.
+    # Prefer UTF-8; fall back to replacement instead of tracebacks.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     print("==============================================")
-    print("Load clean-v1 sources (Unihan + MOE stroke + MOE audio)")
+    print("Load clean-v1 sources (Unihan + MOE stroke; CNS11643 audio)")
     print("==============================================")
 
     unihan = UnihanIndex(UNIHAN_DIR, UNICODE_DIR / "CJKRadicals.txt")
     strokes = StrokeIndex()
-    audio = CleanAudioResolver(MOE_DICT_AUDIO)
 
     grounder = CleanGrounder(unihan=unihan, strokes=strokes)
 
     llm = None
+    llm_model: str | None = None
+    text_info: dict = {"mode": "", "provider": "", "model": ""}
     if not args.no_ai:
-        if not llm_base_url:
-            raise SystemExit(
-                "No LLM base URL configured. Set llm.base_url in "
-                "config/config.local.json (see config/config.example.json) "
-                "or pass --llm-base-url for debugging."
-            )
-        llm = LLMClient(
-            base_url=llm_base_url,
-            model=llm_model,
-            timeout=llm_timeout,
-        )
-        llm.session.trust_env = bool(config["llm"].get("trust_env", False))
+        try:
+            llm = LLMClient(text_cfg)
+        except ValueError as exc:
+            raise SystemExit(f"Bad text config: {exc}")
+        desc = llm.provider_desc
+        llm_model = desc.get("model", "") or desc.get("model_id", "")
+        text_info = {
+            "mode": desc.get("mode", ""),
+            "provider": desc.get("provider", ""),
+            # Model alias (endpoint) or repo id (local) only — never
+            # URLs, keys, or absolute cache paths.
+            "model": desc.get("model", "") or desc.get("model_id", ""),
+            "model_revision": desc.get("revision", ""),
+        }
+        print(f"[llm] mode={desc.get('mode')} "
+              f"provider={desc.get('provider')} model={llm_model}")
+
+    # Character pronunciation audio: fixed CNS11643 human-recorded
+    # source, resolved by (character, expected Zhuyin). The resolver is
+    # created ONCE and its index loads ONCE for the whole run. Missing
+    # dataset or missing reading => cards without audio (never
+    # synthesized, never substituted).
+    cns_resolver = load_cns_resolver()
+    audio_info = {
+        "source": CNS_SOURCE,
+        "preferred_voice": preferred_voice,
+        "index_records": (cns_resolver.record_count
+                          if cns_resolver else 0),
+    }
+
+    # Notable-sayings cap comes from the active profile
+    # (features.notable_sayings_max_items, default 2, clamped 0..3).
+    try:
+        sayings_max = int((profile.get("features") or {}).get(
+            "notable_sayings_max_items", 2))
+    except (TypeError, ValueError):
+        sayings_max = 2
+    sayings_max = max(0, min(3, sayings_max))
 
     chars, generation_mode = select_characters(strokes, args, config)
     refresh_ai = args.refresh_ai or bool(
@@ -2940,6 +3716,7 @@ def main() -> None:
     media_files: list[Path] = prepare_support_media()
 
     audio_missing = []
+    audio_found = 0
     generation_errors = []
     generated = 0
 
@@ -2962,6 +3739,7 @@ def main() -> None:
                     "components_generated": [],
                     "component_meanings": {},
                     "examples": [],
+                    "notable_sayings": [],
                 }
             else:
                 assert llm is not None
@@ -2970,44 +3748,118 @@ def main() -> None:
                     facts,
                     profile,
                     refresh=refresh_ai,
+                    max_sayings=sayings_max,
                 )
 
             # -------------------------------------------------------------
-            # Audio: MOE original bytes, char-based match, no dict IDs.
+            # Audio: fixed CNS11643 human recording for this card's Hanzi
+            # and expected Zhuyin. Exact match or nothing — never
+            # synthesized, never another reading. MOE recordings are
+            # never used either.
             # -------------------------------------------------------------
-
-            source_audio, audio_info = audio.resolve(char)
 
             audio_field = ""
-            audio_filename = ""
-            audio_sha256 = ""
+            cns_file = ""
+            cns_sha = ""
+            cns_matched_zhuyin = ""
+            cns_record_id = ""
+            cns_voice = ""
+            cns_relpath = ""
+            audio_status = "unavailable"
+            audio_detail: dict = {"reason": "cns_index_unavailable"}
 
-            if source_audio is not None:
-                anki_audio = copy_audio_for_anki(
-                    source_audio,
-                    grounding.ucs,
-                )
-                media_files.append(anki_audio)
-                audio_filename = anki_audio.name
-                audio_sha256 = sha256_file(anki_audio)
-                audio_field = (
-                    f"[sound:{anki_audio.name}]"
-                )
-                print(
-                    f"[audio] {source_audio.name} "
-                    f"-> {anki_audio.name}"
-                )
-            else:
+            if cns_resolver is None:
                 audio_missing.append({
                     "char": char,
                     "ucs": grounding.ucs,
                     "pinyin": grounding.pinyin,
-                    "match": audio_info,
+                    "zhuyin": grounding.zhuyin,
+                    "match": audio_detail,
                 })
-                print(
-                    f"[audio] WARNING: unresolved for {char}: "
-                    f"{audio_info.get('reason')}"
-                )
+                print(f"[cns] no index: no audio for {char}")
+            else:
+                record, minfo = cns_resolver.resolve(
+                    char, grounding.zhuyin, grounding.pinyin,
+                    preferred_voice)
+                if record is None:
+                    audio_detail = {
+                        "reason": minfo.get("reason", "unmatched"),
+                        "expected_zhuyin": minfo.get("expected_zhuyin", ""),
+                    }
+                    audio_missing.append({
+                        "char": char,
+                        "ucs": grounding.ucs,
+                        "pinyin": grounding.pinyin,
+                        "zhuyin": grounding.zhuyin,
+                        "match": audio_detail,
+                    })
+                    print(
+                        f"[cns] WARNING: no exact CNS recording for "
+                        f"{char} {grounding.zhuyin or '(no reading)'}: "
+                        f"{audio_detail['reason']}"
+                    )
+                else:
+                    src_audio = CNS11643_RAW / record.relpath
+                    if not src_audio.exists():
+                        audio_detail = {
+                            "reason": "cns_file_missing",
+                            "relpath": record.relpath,
+                        }
+                        audio_missing.append({
+                            "char": char,
+                            "ucs": grounding.ucs,
+                            "pinyin": grounding.pinyin,
+                            "zhuyin": grounding.zhuyin,
+                            "match": audio_detail,
+                        })
+                        print(
+                            f"[cns] WARNING: indexed CNS file absent for "
+                            f"{char}: {record.relpath}"
+                        )
+                    else:
+                        anki_audio = copy_cns_audio_for_anki(
+                            src_audio,
+                            grounding.ucs,
+                            record.zhuyin_norm,
+                        )
+                        media_files.append(anki_audio)
+                        audio_found += 1
+                        cns_file = anki_audio.name
+                        cns_sha = sha256_file(anki_audio)
+                        cns_matched_zhuyin = record.zhuyin_norm
+                        cns_record_id = record.record_id
+                        cns_voice = record.voice
+                        cns_relpath = record.relpath
+                        audio_field = f"[sound:{anki_audio.name}]"
+                        audio_status = "matched"
+                        audio_detail = {
+                            "reason": "matched",
+                            "record_id": record.record_id,
+                            "candidates": minfo.get("candidates", 1),
+                        }
+                        print(
+                            f"[cns] {char} {record.zhuyin_norm} "
+                            f"-> {anki_audio.name}"
+                        )
+
+            audio_block = build_cns_audio_block(
+                status=audio_status,
+                filename=cns_file,
+                sha256=cns_sha,
+                pronunciation={
+                    "character": char,
+                    "pinyin": grounding.pinyin,
+                    "zhuyin": grounding.zhuyin,
+                },
+                expected_pinyin=grounding.pinyin,
+                expected_zhuyin=normalize_zhuyin(grounding.zhuyin),
+                matched_zhuyin=cns_matched_zhuyin,
+                record_id=cns_record_id,
+                voice=cns_voice,
+                relpath=cns_relpath,
+                reading_ambiguity=len(grounding.pinyin_alternates) > 0,
+                detail=audio_detail,
+            )
 
             # -------------------------------------------------------------
             # Stroke XML: original MOE bytes, base64-encoded directly.
@@ -3037,13 +3889,20 @@ def main() -> None:
             # Render HTML fields (template structure unchanged)
             # -------------------------------------------------------------
 
-            component_html = clean_components_html(enrichment, labels)
+            component_html = clean_components_html(
+                enrichment, labels, unihan=unihan,
+                show_han_viet=show_han_viet)
 
             other_readings = clean_readings_html(
                 grounding.pinyin_alternates, labels)
 
             ex_html = examples_html(
                 enrichment.get("examples", []), labels
+            )
+
+            sayings_html = notable_sayings_html(
+                enrichment.get("notable_sayings", []), labels,
+                show_han_viet=show_han_viet,
             )
 
             note = genanki.Note(
@@ -3070,6 +3929,7 @@ def main() -> None:
                     audio_field,
                     ex_html,
                     build_attribution(profile),
+                    sayings_html,
                 ],
             )
 
@@ -3078,9 +3938,7 @@ def main() -> None:
             card_record = build_card_record(
                 grounding,
                 enrichment,
-                audio_info,
-                audio_filename,
-                audio_sha256,
+                audio_block,
                 stroke_sha256,
                 None if args.no_ai else llm_model,
                 generation_mode,
@@ -3135,9 +3993,11 @@ def main() -> None:
         generation_mode,
         None if args.no_ai else llm_model,
         audio_missing,
+        audio_info,
         generation_errors,
         Path(args.publish_dir),
         target_language,
+        None if args.no_ai else text_info,
     )
 
     write_json(
@@ -3153,10 +4013,15 @@ def main() -> None:
         {
             "requested": len(chars),
             "generated": generated,
+            "characters": chars,
             "errors": len(generation_errors),
             "audio_missing": len(audio_missing),
+            "audio_matched": audio_found,
+            "audio": audio_info,
+            "text": text_info,
             "output": str(output),
-            # Local alias only; the endpoint URL stays in local config.
+            # Text model alias only; endpoint URLs stay in local config
+            # and never reach reports. No machine-specific audio paths.
             "llm_model": (
                 None if args.no_ai
                 else llm_model
@@ -3179,6 +4044,7 @@ def main() -> None:
     print(f"Generated      : {generated}")
     print(f"Errors         : {len(generation_errors)}")
     print(f"Audio missing  : {len(audio_missing)}")
+    print(f"Audio matched  : {audio_found} (CNS11643, no synthesis)")
     print(f"Output         : {output}")
     print(f"Publish manifest : {publish_manifest}")
     print(
