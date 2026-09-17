@@ -1,3 +1,49 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# =========================
+# Build / packaging
+# =========================
 build/
+dist/
+*.egg-info/
+
+# =========================
+# Local data / generated files
+# =========================
 data/
 *.zip
+
+# =========================
+# Local / private config
+# =========================
+config.local.json
+.env
+.env.*
+!.env.example
+
+# =========================
+# Testing / tooling cache
+# =========================
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# =========================
+# IDE / OS
+# =========================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

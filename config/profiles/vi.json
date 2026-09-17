@@ -1,0 +1,39 @@
+{
+    "_comment": "Learner-language profile: Vietnamese. Copy this file to add a new target language (e.g. ja.json), then translate the labels/llm instruction and set language-specific features.",
+    "language_code": "vi",
+    "language_name": "Vietnamese",
+    "native_name": "Tiếng Việt",
+
+    "labels": {
+        "hanviet": "Hán-Việt",
+        "unihan": "Unihan",
+        "variants": "Biến thể",
+        "structure": "Cấu tạo chữ",
+        "stroke_order": "Thứ tự nét",
+        "examples": "Ví dụ",
+        "other_readings_title": "Âm đọc khác (Unihan)",
+        "table_pinyin": "Pinyin",
+        "table_zhuyin": "Zhuyin",
+        "table_hanviet": "Hán-Việt",
+        "table_note": "Ghi chú",
+        "table_character": "Chữ",
+        "table_role": "Vai trò",
+        "table_meaning": "Nghĩa",
+        "role_radical": "Bộ thủ",
+        "role_component": "Thành phần",
+        "component_role_ai": "Thành phần (AI gợi ý)",
+        "components_disclaimer": "Thành phần do AI gợi ý để học, không phải dữ liệu IDS có thẩm quyền.",
+        "no_components": "Chưa có dữ liệu component.",
+        "no_examples": "Chưa có ví dụ.",
+        "alternate_reading_note": "Alternate Unihan kMandarin reading (not primary)",
+        "attribution_ai": "Nội dung tiếng Việt và ví dụ do AI tạo, chỉ dùng để học tham khảo."
+    },
+
+    "features": {
+        "show_han_viet": true
+    },
+
+    "llm": {
+        "instruction": "Write all learner-facing explanations (meaning, structure explanation, component glosses, example translations) in natural, concise Vietnamese suitable for learners."
+    }
+}

@@ -1,0 +1,17 @@
+{
+    "_comment": "EXAMPLE config - safe to commit. Copy to config.local.json (same directory) and adjust for your machine. Never put secrets/API keys in tracked files.",
+    "mode": "test",
+    "profile": "vi",
+    "test_character": "思",
+    "llm": {
+        "base_url": "http://127.0.0.1:8080/v1",
+        "model": "example-model-alias",
+        "timeout_seconds": 180,
+        "trust_env": false
+    },
+    "generation": {
+        "refresh_ai": false,
+        "deck_name": "Taiwan Traditional Chinese - MOE",
+        "output": "build/taiwan_traditional_chinese.apkg"
+    }
+}

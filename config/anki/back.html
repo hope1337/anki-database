@@ -1,0 +1,79 @@
+{{FrontSide}}
+
+<hr>
+
+<div class="reading-line">
+    <span class="pinyin">{{Pinyin}}</span>
+    <span class="dot">·</span>
+    <span class="zhuyin">{{Zhuyin}}</span>
+</div>
+
+{{#HanViet}}
+<div class="hanviet">
+    %%LABEL_HANVIET%%: {{HanViet}}
+</div>
+{{/HanViet}}
+
+<div class="audio-box">
+    {{Audio}}
+</div>
+
+<div class="meaning">
+    {{Meaning}}
+</div>
+
+<div class="moe-definition">
+    <span class="label">%%LABEL_UNIHAN%%:</span>
+    {{DefinitionEN}}
+</div>
+
+{{OtherReadingsHTML}}
+
+<hr>
+
+<div class="section-title">%%LABEL_STRUCTURE%%</div>
+
+<div class="ids">
+    <span class="label">%%LABEL_VARIANTS%%:</span>
+    {{Variants}}
+</div>
+
+<div class="structure-explanation">
+    {{StructureExplanation}}
+</div>
+
+{{ComponentsHTML}}
+
+<div class="section-title">%%LABEL_STROKE_ORDER%%</div>
+
+<div class="moe-player">
+    <svg
+        id="moe-svg"
+        xmlns="http://www.w3.org/2000/svg">
+    </svg>
+
+    <div class="moe-controls">
+        <button onclick="moeReplay()">↻ Replay</button>
+        <button onclick="moePause()">⏸ Pause</button>
+        <button onclick="moeResume()">▶ Play</button>
+        <button onclick="moeNext()">→ Next stroke</button>
+        <button onclick="moeGrid()"># Grid</button>
+    </div>
+</div>
+
+<div id="moe-stroke-data" style="display:none">
+    {{StrokeDataB64}}
+</div>
+
+%%MOE_PLAYER_JS%%
+
+<hr>
+
+<div class="section-title">%%LABEL_EXAMPLES%%</div>
+{{ExamplesHTML}}
+
+<hr>
+
+<div class="source-note">
+    {{SourceNote}}
+</div>

@@ -2,30 +2,32 @@
 """
 download.py
 
-Bootstrap toàn bộ data cần cho project Anki tiếng Trung phồn thể từ một thư mục
-data/ trống.
+Bootstrap data for the Traditional-Chinese Anki project from an empty
+data/ directory.
 
-Mặc định script sẽ:
-1) Tạo cấu trúc thư mục data/ rõ ràng.
-2) Tự đọc trang download chính thức của MOE Taiwan để tìm link hiện tại.
-3) Tải:
-   - MOE stroke-order embed CSV
-   - MOE 6063 PNG stroke-order (fallback/reference)
-   - MOE JS player tối thiểu dùng cho animation offline trong Anki
-   - MOE 國語辭典簡編本 text database
-   - MOE 國語辭典簡編本 single-character audio package
-   - Hán-Việt dataset
-   - CHISE IDS decomposition data
-   - Unicode Unihan + CJKRadicals
-4) Giải nén các ZIP.
-5) Đọc CSV stroke catalog và crawl từng trang MOE để trích XML vector stroke
-   chính thức cho từng chữ. Có resume: XML đã có thì bỏ qua.
-6) Tạo manifest/checksum để sau này generate.py biết nguồn nào đang dùng.
+CLEAN-v1 DEFAULT PIPELINE (what `python download.py` fetches):
+  1) MOE Taiwan stroke-order source (embed CSV + per-char XML + JS player
+     + optional 6063 PNG fallback)
+  2) MOE Taiwan single-character pronunciation audio package
+  3) Unicode Unihan (VERSION-PINNED, see UNICODE_VERSION below) + CJKRadicals
+
+The clean-v1 pipeline does NOT download by default:
+  - MOE dictionary text/definitions (legacy, opt-in via --include-legacy-dict)
+  - Han-Viet CSV / CHISE IDS (legacy, opt-in via --include-legacy-external)
+
+Legacy download code is retained in a clearly marked LEGACY section so
+existing on-disk data is not orphaned and rollback stays possible.
+
+GRANULARITY NOTE:
+  Upstream archives (Unihan.zip, MOE audio ZIP) are distributed ONLY as
+  whole archives. There is no partial download: test mode still downloads
+  the full archives, it only limits per-character work (stroke XML crawl).
+  Download granularity != generation granularity.
 
 Cài dependency:
     pip install requests
 
-Chạy full:
+Chạy full clean-v1:
     python download.py
 
 Test 10 chữ stroke trước:
@@ -39,6 +41,9 @@ Không tải PNG fallback:
 
 Chỉ download raw source, chưa crawl 6063 XML:
     python download.py --skip-stroke-xml
+
+Legacy opt-in (NOT part of clean-v1):
+    python download.py --include-legacy-dict --include-legacy-external
 """
 
 from __future__ import annotations
@@ -147,10 +152,20 @@ CHISE_EXT_A_URL = (
     "https://raw.githubusercontent.com/chise/ids/main/IDS-UCS-Ext-A.txt"
 )
 
-UNIHAN_URL = "https://www.unicode.org/Public/UCD/latest/ucd/Unihan.zip"
-CJK_RADICALS_URL = (
-    "https://www.unicode.org/Public/UCD/latest/ucd/CJKRadicals.txt"
-)
+# =============================================================================
+# Unicode version pin (clean-v1 reproducibility contract).
+# -----------------------------------------------------------------------------
+# The ORIGINAL version of this script used unversioned "latest" URLs:
+#     https://www.unicode.org/Public/UCD/latest/ucd/Unihan.zip
+# clean-v1 pins an explicit version instead. NEVER silently switch this to
+# "latest": bump deliberately and record the new version + hashes in the
+# manifest + DATA_SOURCES_AND_PIPELINE.md.
+# =============================================================================
+
+UNICODE_VERSION = "17.0.0"
+UNICODE_BASE_URL = f"https://www.unicode.org/Public/{UNICODE_VERSION}/ucd"
+UNIHAN_URL = f"{UNICODE_BASE_URL}/Unihan.zip"
+CJK_RADICALS_URL = f"{UNICODE_BASE_URL}/CJKRadicals.txt"
 
 # Direct SVG POC hiện tại chỉ cần 3 file này.
 MOE_PLAYER_ASSETS = {
@@ -275,9 +290,13 @@ def safe_extract_zip(zip_path: Path, dest: Path) -> None:
 # HTTP
 # =============================================================================
 
-def make_session(ignore_env_proxy: bool) -> requests.Session:
+def make_session(ignore_env_proxy: bool, verify: bool = True) -> requests.Session:
     s = requests.Session()
     s.trust_env = not ignore_env_proxy
+    s.verify = verify
+    if not verify:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     retries = Retry(
         total=5,
@@ -311,7 +330,15 @@ def make_session(ignore_env_proxy: bool) -> requests.Session:
 
 def get_text(session: requests.Session, url: str, timeout: int = 60) -> str:
     print(f"[GET] {url}")
-    r = session.get(url, timeout=timeout)
+    try:
+        r = session.get(url, timeout=timeout)
+    except requests.exceptions.SSLError as exc:
+        raise RuntimeError(
+            f"SSL verification failed for {url}: {exc}. "
+            "The MOE stroke-order host uses a TWCA chain that modern "
+            "OpenSSL rejects (root lacks Subject Key Identifier). "
+            "If you trust this host, re-run with --insecure."
+        ) from exc
     r.raise_for_status()
 
     if not r.encoding or r.encoding.lower() == "iso-8859-1":
@@ -353,12 +380,18 @@ def download_file(
     if start:
         print(f"           resume from {human_bytes(start)}")
 
-    r = session.get(
-        url,
-        headers=headers,
-        stream=True,
-        timeout=timeout,
-    )
+    try:
+        r = session.get(
+            url,
+            headers=headers,
+            stream=True,
+            timeout=timeout,
+        )
+    except requests.exceptions.SSLError as exc:
+        raise RuntimeError(
+            f"SSL verification failed for {url}: {exc}. "
+            "Re-run with --insecure if you trust this host."
+        ) from exc
     r.raise_for_status()
 
     if start > 0 and r.status_code == 206:
@@ -717,18 +750,18 @@ def write_data_readme() -> None:
 - `failed_pages/`: log lỗi khi crawl XML.
 
 ## raw/moe_dictionary
-- `archives/`: ZIP gốc của 《國語辭典簡編本》.
-- `text/`: database sau khi giải nén.
-- `audio_char/`: audio chữ đơn sau khi giải nén.
+- `archives/`: ZIP gốc của 《國語辭典簡編本》 (LEGACY in clean-v1).
+- `text/`: database sau khi giải nén (LEGACY in clean-v1, kept on disk, not used).
+- `audio_char/`: audio chữ đơn sau khi giải nén (CLEAN-v1: audio IS used).
 
 ## raw/hanviet
-- `hanviet.csv`: traditional char + pinyin -> Hán-Việt.
+- `hanviet.csv`: LEGACY in clean-v1, kept on disk, not used.
 
 ## raw/chise
-- IDS decomposition data.
+- IDS decomposition data. LEGACY in clean-v1, kept on disk, not used.
 
 ## raw/unicode
-- Unihan + CJKRadicals.
+- Unihan (VERSION-PINNED, see UNICODE_VERSION) + CJKRadicals (CLEAN-v1 factual source).
 
 ## processed/indexes
 - `stroke_catalog.jsonl`: index stroke chính để generate.py dùng.
@@ -784,7 +817,17 @@ def main() -> None:
     parser.add_argument(
         "--skip-external",
         action="store_true",
-        help="Không tải Han-Viet / CHISE / Unicode.",
+        help="LEGACY alias: skip Han-Viet / CHISE downloads. Unihan is always fetched for clean-v1.",
+    )
+    parser.add_argument(
+        "--include-legacy-dict",
+        action="store_true",
+        help="LEGACY opt-in: also download MOE dictionary text. NOT part of clean-v1.",
+    )
+    parser.add_argument(
+        "--include-legacy-external",
+        action="store_true",
+        help="LEGACY opt-in: also download Han-Viet / CHISE. NOT part of clean-v1.",
     )
     parser.add_argument(
         "--force",
@@ -796,6 +839,14 @@ def main() -> None:
         action="store_true",
         help="Bỏ HTTP_PROXY/HTTPS_PROXY từ environment.",
     )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Disable TLS certificate verification (needed for the MOE "
+        "stroke-order host whose TWCA chain is rejected by modern "
+        "OpenSSL: missing Subject Key Identifier). Only use if you "
+        "trust the host.",
+    )
 
     args = parser.parse_args()
 
@@ -803,8 +854,11 @@ def main() -> None:
     write_data_readme()
 
     session = make_session(
-        ignore_env_proxy=args.ignore_env_proxy
+        ignore_env_proxy=args.ignore_env_proxy,
+        verify=not args.insecure,
     )
+    if args.insecure:
+        print("WARNING: TLS verification disabled (--insecure).")
 
     print()
     print("==============================================")
@@ -861,25 +915,29 @@ def main() -> None:
 
     print()
     print("==============================================")
-    print("3. MOE 國語辭典簡編本")
+    print("3. MOE audio (clean-v1) + MOE dictionary (LEGACY opt-in)")
     print("==============================================")
 
-    dict_zip = (
-        MOE_DICT_ARCHIVES
-        / filename_from_url(moe.dictionary_text_zip)
-    )
+    dict_zip = None
+    if args.include_legacy_dict:
+        dict_zip = (
+            MOE_DICT_ARCHIVES
+            / filename_from_url(moe.dictionary_text_zip)
+        )
 
-    download_file(
-        session,
-        moe.dictionary_text_zip,
-        dict_zip,
-        force=args.force,
-    )
+        download_file(
+            session,
+            moe.dictionary_text_zip,
+            dict_zip,
+            force=args.force,
+        )
 
-    safe_extract_zip(
-        dict_zip,
-        MOE_DICT_TEXT,
-    )
+        safe_extract_zip(
+            dict_zip,
+            MOE_DICT_TEXT,
+        )
+    else:
+        print("(clean-v1: MOE dictionary text skipped; use --include-legacy-dict to fetch)")
 
     audio_zip = None
     if not args.skip_audio:
@@ -902,19 +960,44 @@ def main() -> None:
         )
 
     external_records = []
+    unicode_records = []
 
-    if not args.skip_external:
+    # --- CLEAN-v1: Unicode Unihan + radicals are ALWAYS fetched. ---
+    print()
+    print("==============================================")
+    print(f"4. Unicode {UNICODE_VERSION} (clean-v1, always)")
+    print("==============================================")
+
+    for url, path in [
+        (UNIHAN_URL, UNICODE_ARCHIVES / "Unihan.zip"),
+        (CJK_RADICALS_URL, UNICODE_DIR / "CJKRadicals.txt"),
+    ]:
+        download_file(
+            session,
+            url,
+            path,
+            force=args.force,
+        )
+        unicode_records.append(
+            build_file_record(path, url)
+        )
+
+    safe_extract_zip(
+        UNICODE_ARCHIVES / "Unihan.zip",
+        UNICODE_UNIHAN,
+    )
+
+    # --- LEGACY: Han-Viet / CHISE only on explicit opt-in. ---
+    if args.include_legacy_external and not args.skip_external:
         print()
         print("==============================================")
-        print("4. Han-Viet / CHISE / Unicode")
+        print("4b. Han-Viet / CHISE (LEGACY opt-in)")
         print("==============================================")
 
         external_downloads = [
             (HANVIET_URL, HANVIET_DIR / "hanviet.csv"),
             (CHISE_BASIC_URL, CHISE_DIR / "IDS-UCS-Basic.txt"),
             (CHISE_EXT_A_URL, CHISE_DIR / "IDS-UCS-Ext-A.txt"),
-            (UNIHAN_URL, UNICODE_ARCHIVES / "Unihan.zip"),
-            (CJK_RADICALS_URL, UNICODE_DIR / "CJKRadicals.txt"),
         ]
 
         for url, path in external_downloads:
@@ -927,11 +1010,8 @@ def main() -> None:
             external_records.append(
                 build_file_record(path, url)
             )
-
-        safe_extract_zip(
-            UNICODE_ARCHIVES / "Unihan.zip",
-            UNICODE_UNIHAN,
-        )
+    else:
+        print("(clean-v1: Han-Viet / CHISE skipped; use --include-legacy-external to fetch)")
 
     print()
     print("==============================================")
@@ -978,8 +1058,12 @@ def main() -> None:
 
     source_records = [
         build_file_record(embed_csv, moe.stroke_embed_csv),
-        build_file_record(dict_zip, moe.dictionary_text_zip),
     ]
+
+    if dict_zip is not None:
+        source_records.append(
+            build_file_record(dict_zip, moe.dictionary_text_zip)
+        )
 
     if png_zip:
         source_records.append(
@@ -999,10 +1083,19 @@ def main() -> None:
             )
         )
 
+    source_records.extend(unicode_records)
     source_records.extend(external_records)
 
     manifest = {
         "generated_at_utc": utc_now(),
+        "pipeline": "clean-v1",
+        "unicode_version": UNICODE_VERSION,
+        "unicode_base_url": UNICODE_BASE_URL,
+        "clean_sources": ["moe_stroke", "moe_audio", "unicode"],
+        "legacy_included": {
+            "moe_dictionary_text": dict_zip is not None,
+            "hanviet_chise": bool(external_records),
+        },
         "project_root": str(ROOT),
         "data_root": str(DATA),
         "sources": source_records,
@@ -1031,7 +1124,14 @@ def main() -> None:
                 "source": "https://github.com/chise/ids",
             },
             "unicode": {
-                "source": "https://www.unicode.org/",
+                "version": UNICODE_VERSION,
+                "source": UNICODE_BASE_URL,
+                "notice": (
+                    "See Unicode license/terms at "
+                    "https://www.unicode.org/license.html "
+                    "NEEDS VERIFICATION: copy exact notice into "
+                    "licenses/ + published/licenses/ at publish time."
+                ),
             },
         },
     }

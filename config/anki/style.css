@@ -1,0 +1,146 @@
+.card {
+    font-family:
+        Arial,
+        "Noto Sans CJK TC",
+        "PingFang TC",
+        sans-serif;
+    text-align: center;
+    font-size: 19px;
+    line-height: 1.5;
+}
+
+.front-hanzi {
+    font-size: 104px;
+    margin: 18px;
+}
+
+.reading-line {
+    font-size: 29px;
+    margin: 10px;
+}
+
+.dot {
+    color: #888;
+    margin: 0 8px;
+}
+
+.hanviet {
+    font-size: 24px;
+    font-weight: 700;
+    margin: 8px;
+}
+
+.audio-box {
+    margin: 8px auto;
+}
+
+.meaning {
+    font-size: 25px;
+    font-weight: 600;
+    margin: 14px auto;
+}
+
+.moe-definition {
+    max-width: 720px;
+    margin: 10px auto;
+    font-size: 17px;
+}
+
+.section-title {
+    font-size: 24px;
+    font-weight: 700;
+    margin: 24px 0 10px;
+}
+
+.label {
+    font-weight: 700;
+}
+
+.ids {
+    font-size: 22px;
+    margin: 6px;
+}
+
+.structure-explanation {
+    max-width: 720px;
+    margin: 10px auto 16px;
+}
+
+.info-table {
+    border-collapse: collapse;
+    margin: 12px auto 20px;
+    max-width: 820px;
+    width: 100%;
+}
+
+.info-table th,
+.info-table td {
+    border: 1px solid #aaa;
+    padding: 7px 9px;
+    vertical-align: middle;
+}
+
+.component-char {
+    font-size: 30px;
+}
+
+.moe-player {
+    max-width: 440px;
+    margin: 0 auto;
+}
+
+#moe-svg {
+    display: block;
+    margin: 15px auto;
+    border: 1px solid #aaa;
+    border-radius: 8px;
+    background: white;
+    overflow: hidden;
+}
+
+#moe-svg > svg {
+    width: 100% !important;
+    height: 100% !important;
+}
+
+.moe-controls {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 7px;
+    margin-top: 10px;
+}
+
+.moe-controls button {
+    padding: 7px 10px;
+    font-size: 14px;
+}
+
+.example {
+    max-width: 720px;
+    margin: 18px auto;
+}
+
+.example-zh {
+    font-size: 29px;
+}
+
+.example-pinyin {
+    color: #666;
+    margin-top: 4px;
+}
+
+.example-vi,
+.example-translation {
+    margin-top: 4px;
+}
+
+.source-note,
+.muted {
+    color: #777;
+    font-size: 13px;
+}
+
+hr {
+    margin: 24px 0;
+}

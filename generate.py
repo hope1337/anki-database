@@ -1,74 +1,53 @@
 #!/usr/bin/env python3
 """
-generate.py
+generate.py (clean-v1)
 
 Generate an offline Anki deck for Traditional Chinese using the data layout
 created by download.py.
 
-What this script uses
----------------------
-Deterministic / source data:
-- MOE Taiwan 《國語辭典簡編本》
-    * Traditional headword
-    * Zhuyin
-    * Hanyu Pinyin
-    * radical
-    * stroke count
-    * Chinese definition
-- MOE Taiwan stroke-order data
-    * official per-character vector XML
-    * official JS drawing engine downloaded by download.py
-- MOE Taiwan single-character audio
-- CHISE IDS
-    * modern glyph decomposition / components
-- hanviet-pinyin-wordlist
-    * Sino-Vietnamese reading keyed by Traditional char + Pinyin
-- Unicode Unihan
-    * fallback reading / definition only when MOE has no entry
+CLEAN-v1 SOURCE MODEL:
+  MOE Taiwan  = stroke-order geometry + pronunciation audio ONLY.
+  Unicode Unihan (version-pinned) = ALL factual text (pinyin, radical,
+      stroke count, variants, kDefinition English grounding).
+  Deterministic local code = normalization + pinyin->zhuyin + indexes.
+  Language profile (config/profiles/<code>.json) = learner language,
+      card labels, optional per-language features, LLM instruction.
+  LLM = learner-language meaning, structure explanation, component
+      glosses, example sentences. NEVER authoritative facts.
 
-LLM responsibilities:
-- translate / condense meaning into Vietnamese
-- explain the modern character structure in Vietnamese
-- translate component meanings into Vietnamese
-- create example sentences in Traditional Chinese + Pinyin + Vietnamese
-
-The LLM is NOT allowed to change source-grounded Pinyin, Zhuyin, Hán-Việt,
-radical, IDS, or stroke-order data.
+The MOE concise dictionary, CHISE IDS, and the old external Han-Viet
+dataset are LEGACY: their classes remain below in a marked LEGACY section
+for rollback/reference, but the clean path never calls them.
 
 Install:
     pip install genanki requests openpyxl
 
+Local config (config/config.local.json, see config/config.example.json):
+    {"mode": "test"|"official", "profile": "vi", "test_character": "思",
+     "llm": {"base_url": ..., "model": ..., "timeout_seconds": 180,
+             "trust_env": false}, ...}
+Default mode is TEST (exactly one configurable character).
+
 Typical workflow
 ----------------
-Default production run (all downloaded stroke characters):
+Test (default, one character from config):
     python generate.py
 
-1) Test one character:
-    python generate.py \
-        --chars 思 \
-        --llm-base-url http://100.123.148.6:8080/v1 \
-        --llm-model qwen3
+Official (full set):
+    # set "mode": "official" in config/config.local.json, then:
+    python generate.py
 
-2) Generate a few characters:
-    python generate.py \
-        --chars 思志學心 \
-        --llm-base-url http://100.123.148.6:8080/v1
-
-3) Generate the first 100 available stroke characters:
-    python generate.py \
-        --limit 100 \
-        --llm-base-url http://100.123.148.6:8080/v1
-
-4) Generate all available stroke characters:
-    python generate.py \
-        --all \
-        --llm-base-url http://100.123.148.6:8080/v1
+Debug overrides:
+    python generate.py --chars 思 --limit 1 --no-ai
 
 Important:
-- LLM results are cached in data/processed/llm/.
+- LLM results are cached per profile in data/processed/llm/<lang>/.
+  Switching profile never reuses another language's enrichment.
 - Normalized card records are saved in data/processed/cards/.
+- Published Android-ready snapshot: data/published/reference-v1/.
 - Re-running does not call the LLM again unless --refresh-ai is used.
-- Audio matching is conservative. A wrong audio clip is worse than no clip.
+- Audio matching is conservative and NEVER uses MOE dictionary IDs.
+  A wrong audio clip is worse than no clip.
   Unresolved files are reported in build/audio_missing.json.
 """
 
@@ -91,7 +70,11 @@ from typing import Any, Iterable
 
 import genanki
 import requests
-from openpyxl import load_workbook
+
+try:
+    from openpyxl import load_workbook
+except ImportError:  # legacy MOE-dictionary path only; clean-v1 is stdlib-only
+    load_workbook = None
 
 
 # =============================================================================
@@ -119,23 +102,63 @@ UNIHAN_DIR = RAW / "unicode" / "unihan"
 LLM_CACHE_DIR = PROCESSED / "llm"
 CARD_CACHE_DIR = PROCESSED / "cards"
 
+# Published Android-ready snapshot (generated immutable artifact).
+PUBLISHED_ROOT = DATA / "published" / "reference-v1"
+PUBLISHED_CHARS = PUBLISHED_ROOT / "characters"
+PUBLISHED_STROKES = PUBLISHED_ROOT / "strokes"
+PUBLISHED_AUDIO = PUBLISHED_ROOT / "audio"
+PUBLISHED_INDEXES = PUBLISHED_ROOT / "indexes"
+PUBLISHED_LICENSES = PUBLISHED_ROOT / "licenses"
+
 BUILD = ROOT / "build"
 BUILD_MEDIA = BUILD / "media"
 BUILD_REPORTS = BUILD / "reports"
 
 
 # =============================================================================
-# Constants
+# Constants (clean-v1)
 # =============================================================================
 
-PROMPT_VERSION = "anki-zh-tw-v1"
+# Grounding contract changed (Unihan facts, no MOE dict/CHISE/HanViet input),
+# so the prompt version MUST differ from the legacy "anki-zh-tw-v1".
+# Bumped again for the language-profile refactor: the prompt is now
+# target-language agnostic and the output schema uses language-neutral keys
+# (meaning/translation/...) instead of meaning_vi/...vi suffixes.
+# Changing profile, prompt, or factual input invalidates the LLM cache.
+PROMPT_VERSION = "anki-zh-generic-v1"
+
+# Pinned Unicode version for the clean-v1 reproducibility contract.
+# Must match UNICODE_VERSION in download.py. Never "latest".
+UNICODE_VERSION = "17.0.0"
+
+# Normalized-record + published-dataset schema versions.
+CLEAN_SCHEMA_VERSION = "clean-v1"
+REFERENCE_DATASET_VERSION = "reference-v1"
+
+# Canonical user-editable configuration lives under config/.
+CONFIG_DIR = ROOT / "config"
+CONFIG_PROFILES_DIR = CONFIG_DIR / "profiles"
+CONFIG_ANKI_DIR = CONFIG_DIR / "anki"
+CONFIG_LOCAL = CONFIG_DIR / "config.local.json"
+CONFIG_EXAMPLE = CONFIG_DIR / "config.example.json"
+
+# Local connection defaults live in config/config.local.json (untracked).
+# generate.py intentionally contains NO hardcoded IP/port: an empty base URL
+# here forces an explicit error telling the user where to configure it.
+DEFAULT_LLM_BASE_URL = ""
+DEFAULT_LLM_MODEL = "qwen3"
+DEFAULT_LLM_TIMEOUT = 180
 
 ANKI_MODEL_ID = 1739018113
 ANKI_DECK_ID = 2059418113
 
-MOE_ATTRIBUTION = (
-    "字形、筆順、字音與辭典資料來源："
-    "中華民國教育部（MOE Taiwan）。"
+# Attribution must NOT claim MOE provided dictionary/definition content:
+# clean-v1 uses MOE for strokes + audio only; text facts come from Unicode.
+# The learner-language tail sentence comes from the active profile
+# (labels.attribution_ai); see build_attribution().
+MOE_ATTRIBUTION_BASE = (
+    "筆順與字音：中華民國教育部（MOE Taiwan）。"
+    "文字事實：Unicode Unihan。"
 )
 
 IDC_ARITY = {
@@ -261,7 +284,575 @@ def json_from_model_text(text: str) -> dict:
 
 
 # =============================================================================
-# MOE dictionary
+# Local config (clean-v1 §11)
+# =============================================================================
+
+def _read_json_first(paths: list[Path]) -> tuple[Any, Path | None]:
+    """Read the first existing path as JSON. Returns (data, path or None)."""
+    for path in paths:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8")), path
+    return {}, None
+
+
+def load_local_config() -> dict:
+    """Load config/config.local.json; fall back to built-in defaults.
+
+    Never contacts the network. The LLM endpoint lives here, never in the
+    published dataset manifest.
+    """
+    defaults = {
+        "mode": "test",
+        "profile": "vi",
+        "test_character": "思",
+        "llm": {
+            "base_url": DEFAULT_LLM_BASE_URL,
+            "model": DEFAULT_LLM_MODEL,
+            "timeout_seconds": DEFAULT_LLM_TIMEOUT,
+            "trust_env": False,
+        },
+        "generation": {
+            "refresh_ai": False,
+            "deck_name": "Taiwan Traditional Chinese - MOE",
+            "output": str(BUILD / "taiwan_traditional_chinese.apkg"),
+        },
+    }
+    user, used_path = _read_json_first([CONFIG_LOCAL])
+    if used_path is None:
+        return defaults
+    try:
+        if not isinstance(user, dict):
+            raise ValueError("top-level JSON must be an object")
+    except (OSError, ValueError) as exc:
+        print(f"[config] WARNING: cannot parse {used_path}: {exc}; using defaults")
+        return defaults
+    merged = dict(defaults)
+    for key, value in user.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = {**merged[key], **value}
+        else:
+            merged[key] = value
+    return merged
+
+
+# =============================================================================
+# Language profiles (target-language architecture)
+# -----------------------------------------------------------------------------
+# The core pipeline is language-neutral. All learner-facing text (card
+# labels, LLM target-language instruction, optional per-language features
+# such as Han-Viet for Vietnamese) comes from config/profiles/<code>.json.
+# To add a language: copy vi.json, translate labels + llm.instruction,
+# set features, and select it via "profile" in config/config.local.json.
+# =============================================================================
+
+DEFAULT_PROFILE_LABELS = {
+    "hanviet": "Han-Viet",
+    "unihan": "Unihan",
+    "variants": "Variants",
+    "structure": "Character structure",
+    "stroke_order": "Stroke order",
+    "examples": "Examples",
+    "other_readings_title": "Other readings (Unihan)",
+    "table_pinyin": "Pinyin",
+    "table_zhuyin": "Zhuyin",
+    "table_hanviet": "Han-Viet",
+    "table_note": "Note",
+    "table_character": "Character",
+    "table_role": "Role",
+    "table_meaning": "Meaning",
+    "role_radical": "Radical",
+    "role_component": "Component",
+    "component_role_ai": "Component (AI suggestion)",
+    "components_disclaimer": "Components suggested by AI for learning; not authoritative IDS data.",
+    "no_components": "No component data yet.",
+    "no_examples": "No examples yet.",
+    "alternate_reading_note": "Alternate Unihan kMandarin reading (not primary)",
+    "attribution_ai": "Explanations and examples generated by AI for learning reference only.",
+}
+
+
+def load_profile(code: str) -> dict:
+    """Load config/profiles/<code>.json with safe English-label fallback.
+
+    Never contacts the network. Unknown/missing profiles fall back to
+    built-in defaults so generation never crashes on a typo; the effective
+    language_code is always echoed in records and manifests.
+    """
+    code = (code or "vi").strip().lower() or "vi"
+    data, _ = _read_json_first([CONFIG_PROFILES_DIR / f"{code}.json"])
+    if not isinstance(data, dict):
+        data = {}
+    labels = dict(DEFAULT_PROFILE_LABELS)
+    if isinstance(data.get("labels"), dict):
+        for key, value in data["labels"].items():
+            if isinstance(value, str) and value.strip():
+                labels[key] = value
+    features = data.get("features") if isinstance(data.get("features"), dict) else {}
+    llm = data.get("llm") if isinstance(data.get("llm"), dict) else {}
+    return {
+        "language_code": data.get("language_code", code) or code,
+        "language_name": data.get("language_name", code) or code,
+        "native_name": data.get("native_name", "") or "",
+        "labels": labels,
+        "features": features,
+        "llm": llm,
+    }
+
+
+def profile_labels(profile: dict) -> dict:
+    return profile.get("labels", DEFAULT_PROFILE_LABELS)
+
+
+def build_attribution(profile: dict) -> str:
+    """SourceNote field: fixed MOE/Unicode ownership + profile AI tail."""
+    tail = profile_labels(profile).get(
+        "attribution_ai", DEFAULT_PROFILE_LABELS["attribution_ai"])
+    return f"{MOE_ATTRIBUTION_BASE}{tail}"
+
+
+# =============================================================================
+# CLEAN-v1: deterministic Pinyin -> Zhuyin/Bopomofo (§4)
+# -----------------------------------------------------------------------------
+# Isolated, dependency-free, fully deterministic. Zhuyin is NEVER generated
+# by the LLM; it is always derived from the selected Unihan kMandarin reading.
+# =============================================================================
+
+_PINYIN_TONE_MARKS: dict[str, tuple[str, int]] = {}
+for _base, _marks in {
+    "a": ("ā", "á", "ǎ", "à"),
+    "e": ("ē", "é", "ě", "è"),
+    "i": ("ī", "í", "ǐ", "ì"),
+    "o": ("ō", "ó", "ǒ", "ò"),
+    "u": ("ū", "ú", "ǔ", "ù"),
+    "ü": ("ǖ", "ǘ", "ǚ", "ǜ"),
+    "v": ("ǖ", "ǘ", "ǚ", "ǜ"),
+}.items():
+    for _i, _m in enumerate(_marks, start=1):
+        _PINYIN_TONE_MARKS[_m] = (_base, _i)
+    _PINYIN_TONE_MARKS[_base] = (_base, 0)
+_PINYIN_TONE_MARKS["ê"] = ("e", 0)
+_PINYIN_TONE_MARKS["ń"] = ("n", 2)
+_PINYIN_TONE_MARKS["ň"] = ("n", 3)
+_PINYIN_TONE_MARKS["ǹ"] = ("n", 4)
+_PINYIN_TONE_MARKS["m̀"] = ("m", 4)
+
+_ZHUYIN_INITIALS = {
+    "b": "ㄅ", "p": "ㄆ", "m": "ㄇ", "f": "ㄈ",
+    "d": "ㄉ", "t": "ㄊ", "n": "ㄋ", "l": "ㄌ",
+    "g": "ㄍ", "k": "ㄎ", "h": "ㄏ",
+    "j": "ㄐ", "q": "ㄑ", "x": "ㄒ",
+    "zh": "ㄓ", "ch": "ㄔ", "sh": "ㄕ", "r": "ㄖ",
+    "z": "ㄗ", "c": "ㄘ", "s": "ㄙ",
+}
+
+_ZHUYIN_FINALS = {
+    # core finals (w/o medial) keyed by normalized pinyin final
+    "a": "ㄚ", "o": "ㄛ", "e": "ㄜ", "ai": "ㄞ", "ei": "ㄟ",
+    "ao": "ㄠ", "ou": "ㄡ", "an": "ㄢ", "en": "ㄣ",
+    "ang": "ㄤ", "eng": "ㄥ", "ong": "ㄨㄥ",
+    "i": "ㄧ", "ia": "ㄧㄚ", "ie": "ㄧㄝ", "iao": "ㄧㄠ",
+    "iu": "ㄧㄡ", "ian": "ㄧㄢ", "in": "ㄧㄣ",
+    "iang": "ㄧㄤ", "ing": "ㄧㄥ", "iong": "ㄩㄥ",
+    "u": "ㄨ", "ua": "ㄨㄚ", "uo": "ㄨㄛ", "uai": "ㄨㄞ",
+    "ui": "ㄨㄟ", "uan": "ㄨㄢ", "un": "ㄨㄣ",
+    "uang": "ㄨㄤ", "ueng": "ㄨㄥ",
+    "ü": "ㄩ", "üe": "ㄩㄝ", "üan": "ㄩㄢ", "ün": "ㄩㄣ",
+    "er": "ㄦ",
+    # shorthand spellings
+    "iu_": "ㄧㄡ", "ui_": "ㄨㄟ", "un_": "ㄨㄣ",
+    "iou": "ㄧㄡ", "uei": "ㄨㄟ", "uen": "ㄨㄣ",
+    "iou_v": "ㄧㄡ",
+}
+
+_ZHUYIN_TONE_MARKS = {0: "", 1: "", 2: "ˊ", 3: "ˇ", 4: "ˋ", 5: "˙"}
+
+
+def pinyin_to_zhuyin(pinyin: str) -> str:
+    """Deterministically convert one tone-marked pinyin syllable to Zhuyin.
+
+    Returns "" when the input cannot be parsed (caller must leave the
+    field empty, never ask the LLM to invent it).
+    """
+    s = nfc(pinyin).lower().strip().split()[0] if nfc(pinyin).strip() else ""
+    if not s:
+        return ""
+    # Numeric-tone form e.g. "si1" / "hao3".
+    m = re.fullmatch(r"([a-züvê]+)([1-5])", s)
+    if m:
+        base, tone = m.group(1), int(m.group(2))
+        if tone == 5:
+            tone = 0  # neutral handled below via ˙ placement
+            neutral = True
+        else:
+            neutral = False
+    else:
+        base_chars: list[str] = []
+        tone = 0
+        neutral = False
+        for ch in s:
+            if ch in _PINYIN_TONE_MARKS:
+                plain, t = _PINYIN_TONE_MARKS[ch]
+                base_chars.append(plain)
+                if t:
+                    tone = t
+            elif ch.isalpha() or ch in ("ü",):
+                base_chars.append(ch)
+            else:
+                return ""
+        base = "".join(base_chars)
+    if not base:
+        return ""
+    base = base.replace("v", "ü")
+    # Split initial.
+    initial = ""
+    final = base
+    for cand in ("zh", "ch", "sh", "b", "p", "m", "f", "d", "t", "n",
+                 "l", "g", "k", "h", "j", "q", "x", "r", "z", "c", "s"):
+        if base.startswith(cand):
+            rest = base[len(cand):]
+            # Single-letter initial only valid with a non-empty final,
+            # except the syllabic nasal/retroflex handled below.
+            if rest or cand in ("m", "n", "r"):
+                initial, final = cand, rest
+                break
+    if not final:
+        # Syllabic m/n; "r" -> "ri".
+        if base in ("m", "n"):
+            final = base
+            initial = ""
+        else:
+            return ""
+    # Special finals: -i after zh/ch/sh/r/z/c/s, standalone -i/-u/-ü.
+    if final == "i" and initial in ("zh", "ch", "sh", "r", "z", "c", "s"):
+        body = _ZHUYIN_INITIALS[initial]
+    elif final == "i" and not initial:
+        body = "ㄧ"
+    elif final == "u" and not initial:
+        body = "ㄨ"
+    elif final in ("ü",) and not initial:
+        body = "ㄩ"
+    else:
+        # j/q/x + u -> ü finals.
+        if initial in ("j", "q", "x") and final.startswith("u"):
+            trial = "ü" + final[1:]
+            if trial in _ZHUYIN_FINALS:
+                final = trial
+        # -uo variants, w-/y- spellings.
+        if not initial:
+            if final.startswith("w"):
+                final = "u" + final[1:]
+            elif final.startswith("y"):
+                rest = final[1:]
+                final = ("i" + rest) if rest else "i"
+        zh_final = _ZHUYIN_FINALS.get(final)
+        if zh_final is None:
+            return ""
+        body = (_ZHUYIN_INITIALS.get(initial, "") if initial else "") + zh_final
+    if m and tone == 0 and neutral:
+        return "˙" + body
+    mark = _ZHUYIN_TONE_MARKS.get(tone, "")
+    if tone == 5 or (neutral and tone == 0):
+        return "˙" + body
+    if tone in (0, 1):
+        return body + ("ˉ" if tone == 1 else "")
+    return body + mark
+
+
+# =============================================================================
+# CLEAN-v1: Unicode Unihan primary factual source (§3)
+# -----------------------------------------------------------------------------
+# Parses ONLY documented Unihan properties from the version-pinned Unihan.zip
+# extract (data/raw/unicode/unihan/). Never invents missing fields.
+# =============================================================================
+
+@dataclass
+class UnihanFacts:
+    char: str
+    ucs: str
+    pinyin: str = ""            # first kMandarin token (selected reading)
+    pinyin_alternates: list = field(default_factory=list)
+    definition_en: str = ""     # kDefinition (English grounding, NOT Chinese)
+    radical_number: str = ""    # from kRSUnicode, e.g. "61"
+    radical_char: str = ""      # resolved via CJKRadicals.txt
+    stroke_count: str = ""      # first kTotalStrokes value
+    stroke_counts_all: list = field(default_factory=list)
+    traditional_variants: list = field(default_factory=list)
+    simplified_variants: list = field(default_factory=list)
+    vietnamese: str = ""        # kVietnamese (provenance tracked; semantics documented)
+
+
+class UnihanIndex:
+    """Version-pinned Unihan factual index (clean-v1 primary text source)."""
+
+    CONSUMED_PROPS = {
+        "kMandarin", "kDefinition", "kRSUnicode", "kTotalStrokes",
+        "kTraditionalVariant", "kSimplifiedVariant", "kVietnamese",
+    }
+
+    def __init__(self, unihan_dir: Path, radicals_path: Path):
+        self.unihan_dir = unihan_dir
+        self.facts: dict[str, UnihanFacts] = {}
+        self._load(unihan_dir, radicals_path)
+
+    @staticmethod
+    def _iter_prop_lines(root: Path):
+        files = sorted(root.glob("Unihan_*.txt"))
+        for path in files:
+            with path.open("r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if not line.strip() or line.startswith("#"):
+                        continue
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) != 3:
+                        continue
+                    yield parts
+
+    @staticmethod
+    def _cp_to_char(cp: str) -> str:
+        if not cp.startswith("U+"):
+            return ""
+        try:
+            return chr(int(cp[2:], 16))
+        except ValueError:
+            return ""
+
+    def _load(self, root: Path, radicals_path: Path) -> None:
+        per_char: dict[str, dict[str, str]] = {}
+        found_any = False
+        for cp, prop, value in self._iter_prop_lines(root):
+            if prop not in self.CONSUMED_PROPS:
+                continue
+            found_any = True
+            char = self._cp_to_char(cp)
+            if len(char) != 1:
+                continue
+            slot = per_char.setdefault(char, {})
+            # First occurrence wins (matches legacy UnihanFallback behavior).
+            if prop not in slot:
+                slot[prop] = value
+        if not found_any:
+            print(f"[unihan] WARNING: no Unihan_*.txt data under {root}")
+        radical_map = self._load_radical_map(radicals_path)
+        for char, props in per_char.items():
+            mandarin = props.get("kMandarin", "")
+            tokens = mandarin.split()
+            pinyin = tokens[0] if tokens else ""
+            rs = props.get("kRSUnicode", "")
+            rad_num = rs.split()[0].split(".")[0] if rs else ""
+            rad_num = "".join(c for c in rad_num if c.isdigit())
+            strokes = props.get("kTotalStrokes", "").split()
+            self.facts[char] = UnihanFacts(
+                char=char,
+                ucs=f"{ord(char):04X}",
+                pinyin=nfc(pinyin),
+                pinyin_alternates=[nfc(t) for t in tokens[1:]],
+                definition_en=nfc(props.get("kDefinition", "")),
+                radical_number=rad_num,
+                radical_char=radical_map.get(rad_num, ""),
+                stroke_count=nfc(strokes[0]) if strokes else "",
+                stroke_counts_all=[nfc(x) for x in strokes],
+                traditional_variants=[
+                    self._cp_to_char(c) or c
+                    for c in props.get("kTraditionalVariant", "").split()
+                ],
+                simplified_variants=[
+                    self._cp_to_char(c) or c
+                    for c in props.get("kSimplifiedVariant", "").split()
+                ],
+                vietnamese=nfc(props.get("kVietnamese", "")),
+            )
+        print(f"[unihan] indexed {len(self.facts):,} characters (Unicode {UNICODE_VERSION})")
+
+    @staticmethod
+    def _load_radical_map(path: Path) -> dict[str, str]:
+        """Map radical number -> radical character via CJKRadicals.txt.
+
+        Handles the official format variants; unknown numbers are left
+        unresolved (caller leaves the display field empty).
+        """
+        mapping: dict[str, str] = {}
+        if not path.exists():
+            print(f"[unihan] WARNING: radicals file not found: {path}")
+            return mapping
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.split(";")]
+            if len(parts) < 2:
+                continue
+            # Format A: "2E80; 1; ..." (codepoint; radical number; ...)
+            # Format B: "1; 4E00 ..." (number first) — accept defensively.
+            try:
+                if re.fullmatch(r"[0-9A-Fa-f]{4,6}", parts[0]):
+                    num = "".join(c for c in parts[1] if c.isdigit())
+                    mapping[num] = chr(int(parts[0], 16))
+                elif parts[0].isdigit():
+                    m = re.search(r"[0-9A-Fa-f]{4,6}", parts[1])
+                    if m:
+                        mapping[parts[0]] = chr(int(m.group(), 16))
+            except (ValueError, IndexError):
+                continue
+        return mapping
+
+    def get(self, char: str) -> UnihanFacts | None:
+        return self.facts.get(char)
+
+
+# =============================================================================
+# CLEAN-v1: MOE audio resolver WITHOUT dictionary IDs (§7)
+# -----------------------------------------------------------------------------
+# Uses only: (a) metadata files shipped inside the audio package,
+# (b) original filename/path structure (exact char stem / char in path).
+# Word IDs (字詞號) are legacy and NEVER consulted here.
+# =============================================================================
+
+class CleanAudioResolver:
+    AUDIO_EXTS = {".wav", ".mp3", ".ogg", ".m4a"}
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.files = [
+            p for p in root.rglob("*")
+            if p.is_file() and p.suffix.lower() in self.AUDIO_EXTS
+        ]
+        self.search_text = {
+            p: unicodedata.normalize("NFKC", p.relative_to(root).as_posix()).lower()
+            for p in self.files
+        }
+        self.char_index: dict[str, list[Path]] = defaultdict(list)
+        for p in self.files:
+            stem = unicodedata.normalize("NFKC", p.stem)
+            if len(stem) == 1 and is_cjk_char(stem):
+                self.char_index[stem].append(p)
+        self.metadata_note = self._scan_metadata(root)
+        print(f"[audio] indexed {len(self.files):,} audio files (clean resolver, no dict IDs)")
+
+    @staticmethod
+    def _scan_metadata(root: Path) -> str:
+        metas = [p for p in root.rglob("*")
+                 if p.is_file() and p.suffix.lower()
+                 in {".csv", ".json", ".txt", ".xml", ".xlsx"}]
+        if not metas:
+            return "no metadata files found in audio package"
+        return f"{len(metas)} metadata candidate(s): " + ", ".join(
+            str(p.relative_to(root)) for p in metas[:10])
+
+    def resolve(self, char: str) -> tuple[Path | None, dict]:
+        if not self.files:
+            return None, {"reason": "no_audio_files"}
+        scored: list[tuple[int, Path, list[str]]] = []
+        for path in self.files:
+            rel = self.search_text[path]
+            score, reasons = 0, []
+            if path.stem == char:
+                score, reasons = 95, ["stem==char"]
+            elif char and char in rel:
+                score, reasons = 80, ["char-in-path"]
+            if score:
+                scored.append((score, path, reasons))
+        if not scored:
+            return None, {"reason": "no_match", "char": char,
+                          "metadata": self.metadata_note}
+        scored.sort(key=lambda x: (-x[0], str(x[1])))
+        best_score = scored[0][0]
+        best = [x for x in scored if x[0] == best_score]
+        if best_score < 80 or len(best) != 1:
+            return None, {
+                "reason": "ambiguous_or_low_confidence",
+                "best_score": best_score,
+                "candidates": [
+                    {"path": str(x[1].relative_to(self.root)),
+                     "score": x[0], "reasons": x[2]} for x in best[:10]
+                ],
+            }
+        return best[0][1], {
+            "reason": "matched",
+            "score": best[0][0],
+            "match_reasons": best[0][2],
+            "source_path": str(best[0][1].relative_to(self.root)),
+        }
+
+
+# =============================================================================
+# CLEAN-v1 grounding: Unihan facts + MOE stroke index (§1, §10)
+# =============================================================================
+
+@dataclass
+class CleanGrounding:
+    char: str
+    ucs: str
+    pinyin: str
+    pinyin_alternates: list
+    zhuyin: str
+    definition_en: str
+    radical_number: str
+    radical_char: str
+    stroke_count: str
+    traditional_variants: list
+    simplified_variants: list
+    vietnamese_raw: str
+    stroke_xml_path: str
+
+
+class CleanGrounder:
+    def __init__(self, unihan: UnihanIndex, strokes: "StrokeIndex"):
+        self.unihan = unihan
+        self.strokes = strokes
+
+    def build(self, char: str) -> CleanGrounding:
+        stroke = self.strokes.get(char)
+        if stroke is None:
+            raise RuntimeError(f"No offline MOE stroke XML for {char}")
+        facts = self.unihan.get(char)
+        if facts is None:
+            # Clearly labeled fallback: no authoritative text facts.
+            # Zhuyin stays empty (never LLM-invented).
+            return CleanGrounding(
+                char=char, ucs=stroke.ucs, pinyin="",
+                pinyin_alternates=[], zhuyin="",
+                definition_en="", radical_number="",
+                radical_char="", stroke_count="",
+                traditional_variants=[], simplified_variants=[],
+                vietnamese_raw="",
+                stroke_xml_path=str(stroke.xml_path),
+            )
+        return CleanGrounding(
+            char=char, ucs=facts.ucs, pinyin=facts.pinyin,
+            pinyin_alternates=facts.pinyin_alternates,
+            zhuyin=pinyin_to_zhuyin(facts.pinyin) if facts.pinyin else "",
+            definition_en=facts.definition_en,
+            radical_number=facts.radical_number,
+            radical_char=facts.radical_char,
+            stroke_count=facts.stroke_count,
+            traditional_variants=facts.traditional_variants,
+            simplified_variants=facts.simplified_variants,
+            vietnamese_raw=facts.vietnamese,
+            stroke_xml_path=str(stroke.xml_path),
+        )
+
+    def facts_block(self, g: CleanGrounding) -> dict:
+        """CLEAN source facts sent to the LLM (§8). No MOE dict text."""
+        return {
+            "character": g.char,
+            "pinyin": g.pinyin,
+            "zhuyin": g.zhuyin,
+            "unicode_definition_en": g.definition_en,
+            "radical": g.radical_char,
+            "radical_number": g.radical_number,
+            "stroke_count": g.stroke_count,
+            "variants": {
+                "traditional": g.traditional_variants,
+                "simplified": g.simplified_variants,
+            },
+        }
+
+
+# =============================================================================
+# LEGACY (pre-clean-v1) SOURCES — NOT used by the clean pipeline.
+# -----------------------------------------------------------------------------
+# Retained for rollback/reference; existing on-disk downloads are preserved.
+# Do NOT call these from the clean path.
 # =============================================================================
 
 @dataclass
@@ -358,6 +949,11 @@ class MoeDictionary:
         return None
 
     def _load(self) -> None:
+        if load_workbook is None:
+            raise RuntimeError(
+                "openpyxl is required only for the LEGACY MOE dictionary "
+                "path (pip install openpyxl). Clean-v1 never calls this."
+            )
         path = self._find_workbook()
         self.workbook_path = path
         print(f"[dictionary] {path}")
@@ -451,7 +1047,7 @@ class MoeDictionary:
 
 
 # =============================================================================
-# Hán-Việt
+# LEGACY: Hán-Việt external dataset (NOT used by clean-v1)
 # =============================================================================
 
 class HanVietIndex:
@@ -509,7 +1105,7 @@ class HanVietIndex:
 
 
 # =============================================================================
-# CHISE IDS
+# LEGACY: CHISE IDS (NOT used by clean-v1; LLM components are AI enrichment)
 # =============================================================================
 
 @dataclass
@@ -645,7 +1241,7 @@ class ChiseIndex:
 
 
 # =============================================================================
-# Unihan fallback
+# LEGACY: UnihanFallback (superseded by UnihanIndex; NOT used by clean-v1)
 # =============================================================================
 
 class UnihanFallback:
@@ -783,7 +1379,8 @@ class StrokeIndex:
 
 
 # =============================================================================
-# Audio matching
+# LEGACY: AudioResolver (used MOE dict 字詞號; NOT used by clean-v1 —
+# see CleanAudioResolver above)
 # =============================================================================
 
 class AudioResolver:
@@ -918,7 +1515,7 @@ class AudioResolver:
 
 
 # =============================================================================
-# Source-grounded character/component information
+# LEGACY: MOE-dictionary grounding (NOT used by clean-v1 — see CleanGrounder)
 # =============================================================================
 
 @dataclass
@@ -1115,31 +1712,36 @@ class LLMClient:
 
     def enrich(
         self,
-        grounding: CharacterGrounding,
+        grounding: CleanGrounding,
+        facts: dict,
+        profile: dict,
         *,
         refresh: bool,
     ) -> dict:
+        profile_code = str(profile.get("language_code", "vi") or "vi")
+        language_name = str(profile.get("language_name", profile_code)
+                             or profile_code)
+        profile_instruction = str(
+            (profile.get("llm") or {}).get("instruction", "") or "").strip()
+        if not profile_instruction:
+            profile_instruction = (
+                "Write all learner-facing explanations in the learner's "
+                "language."
+            )
         cache_path = (
             LLM_CACHE_DIR
+            / profile_code
             / f"U+{grounding.ucs}.json"
         )
 
-        facts = {
-            "character": grounding.char,
-            "primary_reading": asdict(grounding.primary),
-            "other_readings": [
-                asdict(x) for x in grounding.other_readings
-            ],
-            "radical": grounding.radical,
-            "stroke_count": grounding.stroke_count,
-            "ids": grounding.ids,
-            "components": [
-                asdict(x) for x in grounding.components
-            ],
-        }
-
         input_hash = sha256_text(
             PROMPT_VERSION
+            + "\n"
+            + self.model
+            + "\n"
+            + profile_code
+            + "\n"
+            + profile_instruction
             + "\n"
             + json.dumps(
                 facts,
@@ -1159,41 +1761,54 @@ class LLMClient:
                 )
                 return cached["result"]
 
-        system_prompt = """
-Bạn là biên tập viên flashcard tiếng Hoa phồn thể dành cho người Việt.
+        system_prompt = f"""
+You are creating Traditional Chinese learner content for a learner whose
+destination language is {language_name}.
 
-Quy tắc bắt buộc:
-1. Luôn dùng chữ PHỒN THỂ ĐÀI LOAN trong câu ví dụ.
-2. Dữ liệu trong SOURCE_FACTS là ground truth. Không được sửa Pinyin,
-   Zhuyin, Hán-Việt, bộ thủ, IDS hay stroke count.
-3. Không bịa nguồn gốc lịch sử của chữ. "structure_explanation_vi" chỉ
-   được giải thích CẤU TẠO HÌNH THỂ HIỆN ĐẠI theo IDS và các component
-   được cung cấp. Nếu không đủ dữ liệu thì nói ngắn gọn rằng chưa đủ dữ
-   liệu để kết luận.
-4. meaning_vi phải là nghĩa tiếng Việt tự nhiên, ngắn, hữu dụng cho
-   người học; dựa trên definition_zh được cung cấp.
-5. component_meanings_vi chỉ dịch/diễn giải nghĩa của component đã được
-   cung cấp. Không thay đổi âm đọc.
-6. Tạo 2 câu ví dụ tự nhiên ở mức A2-B1, ưu tiên cách dùng thông dụng ở
-   Đài Loan. Mỗi ví dụ phải có:
-   - zh: tiếng Hoa phồn thể
-   - pinyin: Hanyu Pinyin có dấu thanh
-   - vi: bản dịch tiếng Việt tự nhiên
-7. Chỉ trả JSON hợp lệ. Không Markdown, không giải thích ngoài JSON.
+The data in SOURCE_FACTS is ground truth from Unicode Unihan (romanization,
+radical, stroke count, variants, English definition). Do not modify these
+facts and do not derive Zhuyin yourself.
+
+Profile instruction:
+{profile_instruction}
+
+Mandatory rules:
+1. Always use TAIWAN Traditional Chinese in example sentences.
+2. "meaning" must be a natural, short, useful gloss in the destination
+   language, grounded in the unicode_definition_en provided.
+3. "structure_explanation" may only describe a memory-level breakdown for
+   learners (AI enrichment, NOT authoritative IDS data). Do not invent
+   historical etymology. If the data is insufficient, briefly say so
+   instead of concluding.
+4. "components_generated" are AI-suggested memory components, not
+   authoritative CHISE/Unicode data. "component_meanings" only glosses
+   those components in the destination language.
+5. "han_viet_suggestion": optionally suggest a Sino-Vietnamese-style
+   reading aid for the learner; this is an AI value, never an official
+   reading. Leave it empty when it adds no value for this destination
+   language.
+6. Create 2 natural example sentences at level A2-B1, preferring usage
+   common in Taiwan. Each example must have:
+   - zh: Traditional Chinese
+   - pinyin: Hanyu Pinyin with tone marks
+   - translation: natural translation in the destination language
+7. Return valid JSON only. No Markdown, no explanation outside JSON.
 
 Schema:
-{
-  "meaning_vi": "...",
-  "structure_explanation_vi": "...",
-  "component_meanings_vi": {
+{{
+  "meaning": "...",
+  "han_viet_suggestion": "...",
+  "structure_explanation": "...",
+  "components_generated": ["...", "..."],
+  "component_meanings": {{
     "心": "...",
     "田": "..."
-  },
+  }},
   "examples": [
-    {"zh": "...", "pinyin": "...", "vi": "..."},
-    {"zh": "...", "pinyin": "...", "vi": "..."}
+    {{"zh": "...", "pinyin": "...", "translation": "..."}},
+    {{"zh": "...", "pinyin": "...", "translation": "..."}}
   ]
-}
+}}
 """.strip()
 
         user_prompt = (
@@ -1258,6 +1873,7 @@ Schema:
             {
                 "prompt_version": PROMPT_VERSION,
                 "input_hash": input_hash,
+                "target_language": profile_code,
                 "facts": facts,
                 "result": result,
             },
@@ -1267,12 +1883,26 @@ Schema:
 
     @staticmethod
     def _validate_result(result: dict) -> dict:
-        meaning_vi = nfc(result.get("meaning_vi"))
-        structure = nfc(result.get("structure_explanation_vi"))
+        # Canonical language-neutral keys. Legacy suffixed keys
+        # (meaning_vi, structure_explanation_vi, component_meanings_vi,
+        # examples[].vi, han_viet_generated) are accepted and migrated so
+        # old cached/edge-case outputs do not break generation.
+        meaning = nfc(result.get("meaning") or result.get("meaning_vi"))
+        structure = nfc(result.get("structure_explanation")
+                        or result.get("structure_explanation_vi"))
+        han_viet_suggestion = nfc(result.get("han_viet_suggestion")
+                                  or result.get("han_viet_generated"))
+
+        components_generated = result.get("components_generated", [])
+        if not isinstance(components_generated, list):
+            components_generated = []
+        components_generated = [
+            nfc(c) for c in components_generated[:8] if nfc(c)
+        ]
 
         component_meanings = result.get(
-            "component_meanings_vi",
-            {},
+            "component_meanings",
+            result.get("component_meanings_vi", {}),
         )
         if not isinstance(component_meanings, dict):
             component_meanings = {}
@@ -1288,19 +1918,21 @@ Schema:
 
             zh = nfc(item.get("zh"))
             py = nfc(item.get("pinyin"))
-            vi = nfc(item.get("vi"))
+            tr = nfc(item.get("translation") or item.get("vi"))
 
-            if zh and py and vi:
+            if zh and py and tr:
                 valid_examples.append({
                     "zh": zh,
                     "pinyin": py,
-                    "vi": vi,
+                    "translation": tr,
                 })
 
         return {
-            "meaning_vi": meaning_vi,
-            "structure_explanation_vi": structure,
-            "component_meanings_vi": {
+            "meaning": meaning,
+            "han_viet_suggestion": han_viet_suggestion,
+            "structure_explanation": structure,
+            "components_generated": components_generated,
+            "component_meanings": {
                 nfc(k): nfc(v)
                 for k, v in component_meanings.items()
                 if nfc(k)
@@ -1504,9 +2136,89 @@ PLAYER_JS = r"""
 
 # =============================================================================
 # HTML builders
+# -----------------------------------------------------------------------------
+# CLEAN-v1 renders Unihan facts + explicitly AI-labeled LLM enrichment.
+# Legacy builders (MOE-dictionary based) are kept below for reference.
 # =============================================================================
 
-def readings_html(
+def clean_readings_html(pinyin_alternates: list, labels: dict | None = None) -> str:
+    """Alternate kMandarin readings (Unihan factual, non-primary)."""
+    labels = labels or DEFAULT_PROFILE_LABELS
+    if not pinyin_alternates:
+        return ""
+    rows = "".join(
+        "<tr>"
+        f"<td>{escape(p) or '—'}</td>"
+        "<td>—</td><td>—</td>"
+        f"<td>{escape(labels.get('alternate_reading_note', ''))}</td>"
+        "</tr>"
+        for p in pinyin_alternates
+    )
+    return (
+        f'<div class="section-title">{escape(labels.get("other_readings_title", ""))}</div>'
+        '<table class="info-table">'
+        "<thead><tr>"
+        f"<th>{escape(labels.get('table_pinyin', 'Pinyin'))}</th>"
+        f"<th>{escape(labels.get('table_zhuyin', 'Zhuyin'))}</th>"
+        f"<th>{escape(labels.get('table_hanviet', ''))}</th>"
+        f"<th>{escape(labels.get('table_note', ''))}</th>"
+        "</tr></thead>"
+        "<tbody>"
+        + rows
+        + "</tbody></table>"
+    )
+
+
+def clean_components_html(enrichment: dict, labels: dict | None = None) -> str:
+    """LLM-suggested learning components — AI enrichment, NOT IDS."""
+    labels = labels or DEFAULT_PROFILE_LABELS
+    components = enrichment.get("components_generated", [])
+    meanings = enrichment.get("component_meanings",
+                              enrichment.get("component_meanings_vi", {}))
+    if not isinstance(meanings, dict):
+        meanings = {}
+    if not components:
+        return f'<div class="muted">{escape(labels.get("no_components", ""))}.</div>'
+    rows = []
+    for token in components:
+        rows.append(
+            "<tr>"
+            f'<td class="component-char">{escape(token)}</td>'
+            f"<td>{escape(labels.get('component_role_ai', ''))}</td>"
+            "<td>—</td>"
+            "<td>—</td>"
+            f"<td>{escape(meanings.get(token, '')) or '—'}</td>"
+            "</tr>"
+        )
+    return (
+        '<table class="info-table">'
+        "<thead><tr>"
+        f"<th>{escape(labels.get('table_character', ''))}</th>"
+        f"<th>{escape(labels.get('table_role', ''))}</th><th>Pinyin</th>"
+        f"<th>{escape(labels.get('table_hanviet', ''))}</th>"
+        f"<th>{escape(labels.get('table_meaning', ''))}</th>"
+        "</tr></thead>"
+        "<tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+        f'<div class="muted">{escape(labels.get("components_disclaimer", ""))}</div>'
+    )
+
+
+def clean_variants_text(grounding: CleanGrounding) -> str:
+    """Text for the (backward-compat) IDS field: variant info, never CHISE."""
+    parts = []
+    if grounding.traditional_variants:
+        parts.append("Trad: " + " ".join(grounding.traditional_variants))
+    if grounding.simplified_variants:
+        parts.append("Simp: " + " ".join(grounding.simplified_variants))
+    if grounding.radical_char:
+        parts.append(
+            f"Radical {grounding.radical_number}: {grounding.radical_char}")
+    return " · ".join(parts)
+
+
+def readings_html(  # LEGACY: MOE-dictionary based, kept for reference
     primary: ReadingInfo,
     others: list[ReadingInfo],
 ) -> str:
@@ -1538,7 +2250,7 @@ def readings_html(
     )
 
 
-def components_html(
+def components_html(  # LEGACY: CHISE/MOE based, kept for reference
     grounding: CharacterGrounding,
     enrichment: dict,
 ) -> str:
@@ -1589,339 +2301,228 @@ def components_html(
     )
 
 
-def examples_html(examples: list[dict]) -> str:
+def examples_html(examples: list[dict], labels: dict | None = None) -> str:
+    labels = labels or DEFAULT_PROFILE_LABELS
     blocks = []
 
     for example in examples:
+        translation = example.get("translation", example.get("vi", ""))
         blocks.append(
             '<div class="example">'
             f'<div class="example-zh">{escape(example.get("zh"))}</div>'
             f'<div class="example-pinyin">{escape(example.get("pinyin"))}</div>'
-            f'<div class="example-vi">{escape(example.get("vi"))}</div>'
+            '<div class="example-translation">'
+            f'{escape(translation)}</div>'
             "</div>"
         )
 
     if not blocks:
-        return '<div class="muted">Chưa có ví dụ.</div>'
+        return f'<div class="muted">{escape(labels.get("no_examples", ""))}</div>'
 
     return "".join(blocks)
 
 
 # =============================================================================
-# Build normalized card records
+# Build normalized card records (clean-v1, provenance-explicit §10)
 # =============================================================================
 
+def _enrichment_entry(value: Any, llm_model: str | None,
+                      source: str = "llm") -> dict:
+    return {"value": value, "source": source, "model": llm_model,
+            "prompt_version": PROMPT_VERSION}
+
+
 def build_card_record(
-    grounding: CharacterGrounding,
+    grounding: CleanGrounding,
     enrichment: dict,
     audio_info: dict,
     audio_filename: str,
+    audio_sha256: str,
+    stroke_sha256: str,
+    llm_model: str | None,
+    generation_mode: str,
+    target_language: str = "vi",
 ) -> dict:
-    components = []
-
-    component_meanings = enrichment.get(
-        "component_meanings_vi",
-        {},
-    )
-
-    for c in grounding.components:
-        components.append({
-            **asdict(c),
-            "meaning_vi": (
-                component_meanings.get(c.char)
-                or component_meanings.get(c.token)
-                or ""
-            ),
-        })
-
+    # Optional language-specific datum: kVietnamese is a Unihan fact, but
+    # it is only surfaced to learners whose profile opts in (show_han_viet).
+    # The LLM suggestion is a learner aid, never an official reading.
+    hanviet_value = grounding.vietnamese_raw
+    hanviet_source = "unicode_unihan.kVietnamese"
+    if not hanviet_value and enrichment.get("han_viet_suggestion"):
+        hanviet_value = enrichment["han_viet_suggestion"]
+        hanviet_source = "llm_generated"
     return {
+        "schema": CLEAN_SCHEMA_VERSION,
         "char": grounding.char,
         "ucs": grounding.ucs,
-        "ids": grounding.ids,
-        "radical": grounding.radical,
-        "stroke_count": grounding.stroke_count,
-        "primary": asdict(grounding.primary),
-        "other_readings": [
-            asdict(x)
-            for x in grounding.other_readings
-        ],
-        "meaning_vi": enrichment.get(
-            "meaning_vi",
-            "",
-        ),
-        "structure_explanation_vi": enrichment.get(
-            "structure_explanation_vi",
-            "",
-        ),
-        "components": components,
-        "examples": enrichment.get("examples", []),
-        "stroke_xml_path": grounding.stroke_xml_path,
-        "audio_filename": audio_filename,
-        "audio_match": audio_info,
+        "target_language": target_language,
+        "facts": {
+            "pinyin": {"value": grounding.pinyin,
+                       "source": "unicode_unihan.kMandarin"},
+            "pinyin_alternates": {
+                "value": grounding.pinyin_alternates,
+                "source": "unicode_unihan.kMandarin"},
+            "zhuyin": {"value": grounding.zhuyin,
+                       "source": "deterministic:pinyin_to_zhuyin"},
+            "definition_en": {"value": grounding.definition_en,
+                              "source": "unicode_unihan.kDefinition"},
+            "radical": {"value": grounding.radical_char,
+                        "source": "unicode_unihan.kRSUnicode+CJKRadicals"},
+            "radical_number": {"value": grounding.radical_number,
+                               "source": "unicode_unihan.kRSUnicode"},
+            "stroke_count": {"value": grounding.stroke_count,
+                             "source": "unicode_unihan.kTotalStrokes"},
+            "variants": {
+                "value": {
+                    "traditional": grounding.traditional_variants,
+                    "simplified": grounding.simplified_variants,
+                },
+                "source": "unicode_unihan.kTraditionalVariant/kSimplifiedVariant",
+            },
+            "han_viet": {"value": hanviet_value,
+                         "source": hanviet_source},
+            "unicode_version": {"value": UNICODE_VERSION,
+                                "source": "download.py:UNICODE_VERSION"},
+        },
+        "enrichment": {
+            "target_language": target_language,
+            "meaning": _enrichment_entry(
+                enrichment.get("meaning", ""), llm_model),
+            "han_viet_suggestion": _enrichment_entry(
+                enrichment.get("han_viet_suggestion", ""), llm_model),
+            "structure_explanation": _enrichment_entry(
+                enrichment.get("structure_explanation", ""), llm_model),
+            "components_generated": _enrichment_entry(
+                enrichment.get("components_generated", []), llm_model,
+                "llm (NOT authoritative IDS)"),
+            "component_meanings": _enrichment_entry(
+                enrichment.get("component_meanings", {}), llm_model),
+            "examples": _enrichment_entry(
+                enrichment.get("examples", []), llm_model),
+        },
+        "media": {
+            "stroke": {
+                "source": "moe_taiwan",
+                "original_xml": str(Path(
+                    grounding.stroke_xml_path).name),
+                "sha256": stroke_sha256,
+                "transform": "none: original bytes base64-encoded",
+            },
+            "audio": {
+                "source": "moe_taiwan",
+                "filename": audio_filename,
+                "sha256": audio_sha256,
+                "match": audio_info,
+                "transform": "none: original bytes copied",
+            },
+        },
+        "generation_mode": generation_mode,
     }
 
 
 # =============================================================================
-# Anki model / package
+# Anki model / package (template externalized under config/anki/)
+# -----------------------------------------------------------------------------
+# Visual design is FROZEN: config/anki/{front,back}.html + style.css hold the
+# exact card layout previously embedded here. Python only substitutes the
+# %%LABEL_*%% tokens from the active profile and appends PLAYER_JS.
+# Field ORDER in model.json is frozen for Anki backward compatibility
+# (notes match by GUID, values map positionally). ANKI_MODEL_ID/ANKI_DECK_ID
+# and guid_for("MOE-TRADITIONAL-V1", char) are unchanged.
 # =============================================================================
 
-def build_anki_model() -> genanki.Model:
+# Fallback copies used only if config/anki/* is missing; the files on disk
+# are canonical. Kept identical to the frozen design (HanViet block without
+# Anki conditional in fallback; file version uses {{#HanViet}}).
+_FALLBACK_ANKI_FIELDS = [
+    "Hanzi", "Zhuyin", "Pinyin", "HanViet", "Meaning", "DefinitionEN",
+    "Variants", "StructureExplanation", "ComponentsHTML",
+    "OtherReadingsHTML", "StrokeDataB64", "Audio", "ExamplesHTML",
+    "SourceNote",
+]
+
+_ANKI_LABEL_TOKENS = (
+    "LABEL_HANVIET", "LABEL_UNIHAN", "LABEL_VARIANTS", "LABEL_STRUCTURE",
+    "LABEL_STROKE_ORDER", "LABEL_EXAMPLES",
+)
+
+_LABEL_KEY_BY_TOKEN = {
+    "LABEL_HANVIET": "hanviet",
+    "LABEL_UNIHAN": "unihan",
+    "LABEL_VARIANTS": "variants",
+    "LABEL_STRUCTURE": "structure",
+    "LABEL_STROKE_ORDER": "stroke_order",
+    "LABEL_EXAMPLES": "examples",
+}
+
+
+def _read_anki_file(name: str) -> str | None:
+    path = CONFIG_ANKI_DIR / name
+    try:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    except OSError:
+        pass
+    return None
+
+
+def load_anki_template(profile: dict) -> dict:
+    """Load external Anki template + substitute profile labels.
+
+    Returns {fields, front, back, css}. No templating engine: plain
+    %%TOKEN%% replacement so advanced users can edit HTML/CSS directly.
+    """
+    labels = profile_labels(profile)
+    fields = list(_FALLBACK_ANKI_FIELDS)
+    raw_model = _read_anki_file("model.json")
+    if raw_model:
+        try:
+            parsed = json.loads(raw_model)
+            if isinstance(parsed.get("fields"), list) and parsed["fields"]:
+                fields = [str(f) for f in parsed["fields"]]
+        except ValueError:
+            print("[anki] WARNING: config/anki/model.json invalid; using fallback fields")
+
+    front = _read_anki_file("front.html")
+    back = _read_anki_file("back.html")
+    css = _read_anki_file("style.css")
+    if front is None or back is None or css is None:
+        print("[anki] WARNING: config/anki/* missing; using embedded fallback template")
+        return {
+            "fields": fields,
+            "front": '<div class="front-hanzi">{{Hanzi}}</div>\n',
+            "back": "{{FrontSide}}\n{{Meaning}}\n",
+            "css": "",
+        }
+    for token in _ANKI_LABEL_TOKENS:
+        key = _LABEL_KEY_BY_TOKEN[token]
+        back = back.replace(f"%%{token}%%",
+                            str(labels.get(key, DEFAULT_PROFILE_LABELS.get(key, ""))))
+    back = back.replace("%%MOE_PLAYER_JS%%", PLAYER_JS)
+    return {"fields": fields, "front": front, "back": back, "css": css}
+
+
+def build_anki_model(profile: dict | None = None) -> genanki.Model:
+    if profile is None:
+        profile = load_profile("vi")
+    tpl = load_anki_template(profile)
+    raw_model = _read_anki_file("model.json")
+    model_name = "Taiwan Traditional Chinese - Offline MOE"
+    template_name = "Recognition"
+    if raw_model:
+        try:
+            parsed = json.loads(raw_model)
+            model_name = str(parsed.get("name", model_name))
+            template_name = str(parsed.get("template_name", template_name))
+        except ValueError:
+            pass
     return genanki.Model(
         ANKI_MODEL_ID,
-        "Taiwan Traditional Chinese - Offline MOE",
-
-        fields=[
-            {"name": "Hanzi"},
-            {"name": "Zhuyin"},
-            {"name": "Pinyin"},
-            {"name": "HanViet"},
-            {"name": "MeaningVN"},
-            {"name": "MOEDefinitionZH"},
-            {"name": "IDS"},
-            {"name": "StructureExplanation"},
-            {"name": "ComponentsHTML"},
-            {"name": "OtherReadingsHTML"},
-            {"name": "StrokeDataB64"},
-            {"name": "Audio"},
-            {"name": "ExamplesHTML"},
-            {"name": "SourceNote"},
-        ],
-
-        templates=[
-            {
-                "name": "Recognition",
-                "qfmt": """
-<div class="front-hanzi">{{Hanzi}}</div>
-""",
-                "afmt": f"""
-{{{{FrontSide}}}}
-
-<hr>
-
-<div class="reading-line">
-    <span class="pinyin">{{{{Pinyin}}}}</span>
-    <span class="dot">·</span>
-    <span class="zhuyin">{{{{Zhuyin}}}}</span>
-</div>
-
-<div class="hanviet">
-    Hán-Việt: {{{{HanViet}}}}
-</div>
-
-<div class="audio-box">
-    {{{{Audio}}}}
-</div>
-
-<div class="meaning">
-    {{{{MeaningVN}}}}
-</div>
-
-<div class="moe-definition">
-    <span class="label">MOE:</span>
-    {{{{MOEDefinitionZH}}}}
-</div>
-
-{{{{OtherReadingsHTML}}}}
-
-<hr>
-
-<div class="section-title">Cấu tạo chữ</div>
-
-<div class="ids">
-    <span class="label">IDS:</span>
-    {{{{IDS}}}}
-</div>
-
-<div class="structure-explanation">
-    {{{{StructureExplanation}}}}
-</div>
-
-{{{{ComponentsHTML}}}}
-
-<div class="section-title">Thứ tự nét</div>
-
-<div class="moe-player">
-    <svg
-        id="moe-svg"
-        xmlns="http://www.w3.org/2000/svg">
-    </svg>
-
-    <div class="moe-controls">
-        <button onclick="moeReplay()">↻ Replay</button>
-        <button onclick="moePause()">⏸ Pause</button>
-        <button onclick="moeResume()">▶ Play</button>
-        <button onclick="moeNext()">→ Next stroke</button>
-        <button onclick="moeGrid()"># Grid</button>
-    </div>
-</div>
-
-<div id="moe-stroke-data" style="display:none">
-    {{{{StrokeDataB64}}}}
-</div>
-
-{PLAYER_JS}
-
-<hr>
-
-<div class="section-title">Ví dụ</div>
-{{{{ExamplesHTML}}}}
-
-<hr>
-
-<div class="source-note">
-    {{{{SourceNote}}}}
-</div>
-""",
-            },
-        ],
-
-        css="""
-.card {
-    font-family:
-        Arial,
-        "Noto Sans CJK TC",
-        "PingFang TC",
-        sans-serif;
-    text-align: center;
-    font-size: 19px;
-    line-height: 1.5;
-}
-
-.front-hanzi {
-    font-size: 104px;
-    margin: 18px;
-}
-
-.reading-line {
-    font-size: 29px;
-    margin: 10px;
-}
-
-.dot {
-    color: #888;
-    margin: 0 8px;
-}
-
-.hanviet {
-    font-size: 24px;
-    font-weight: 700;
-    margin: 8px;
-}
-
-.audio-box {
-    margin: 8px auto;
-}
-
-.meaning {
-    font-size: 25px;
-    font-weight: 600;
-    margin: 14px auto;
-}
-
-.moe-definition {
-    max-width: 720px;
-    margin: 10px auto;
-    font-size: 17px;
-}
-
-.section-title {
-    font-size: 24px;
-    font-weight: 700;
-    margin: 24px 0 10px;
-}
-
-.label {
-    font-weight: 700;
-}
-
-.ids {
-    font-size: 22px;
-    margin: 6px;
-}
-
-.structure-explanation {
-    max-width: 720px;
-    margin: 10px auto 16px;
-}
-
-.info-table {
-    border-collapse: collapse;
-    margin: 12px auto 20px;
-    max-width: 820px;
-    width: 100%;
-}
-
-.info-table th,
-.info-table td {
-    border: 1px solid #aaa;
-    padding: 7px 9px;
-    vertical-align: middle;
-}
-
-.component-char {
-    font-size: 30px;
-}
-
-.moe-player {
-    max-width: 440px;
-    margin: 0 auto;
-}
-
-#moe-svg {
-    display: block;
-    margin: 15px auto;
-    border: 1px solid #aaa;
-    border-radius: 8px;
-    background: white;
-    overflow: hidden;
-}
-
-#moe-svg > svg {
-    width: 100% !important;
-    height: 100% !important;
-}
-
-.moe-controls {
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: center;
-    gap: 7px;
-    margin-top: 10px;
-}
-
-.moe-controls button {
-    padding: 7px 10px;
-    font-size: 14px;
-}
-
-.example {
-    max-width: 720px;
-    margin: 18px auto;
-}
-
-.example-zh {
-    font-size: 29px;
-}
-
-.example-pinyin {
-    color: #666;
-    margin-top: 4px;
-}
-
-.example-vi {
-    margin-top: 4px;
-}
-
-.source-note,
-.muted {
-    color: #777;
-    font-size: 13px;
-}
-
-hr {
-    margin: 24px 0;
-}
-"""
+        model_name,
+        fields=[{"name": name} for name in tpl["fields"]],
+        templates=[{"name": template_name,
+                    "qfmt": tpl["front"], "afmt": tpl["back"]}],
+        css=tpl["css"],
     )
 
 
@@ -1967,6 +2568,186 @@ def copy_audio_for_anki(
 
 
 # =============================================================================
+# Published reference-v1 dataset (§14)
+# -----------------------------------------------------------------------------
+# Generated immutable artifact for Android consumption. Android must never
+# need to understand raw MOE/Unicode layouts. The LLM endpoint (private
+# local config) is NEVER written into the published manifest.
+# =============================================================================
+
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _read_sources_manifest() -> dict:
+    for candidate in (DATA / "manifests" / "sources.json",):
+        if candidate.exists():
+            try:
+                return json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return {}
+    return {}
+
+
+def publish_reference(
+    chars: list[str],
+    generation_mode: str,
+    llm_model: str | None,
+    audio_missing: list,
+    generation_errors: list,
+    publish_dir: Path,
+    target_language: str = "vi",
+) -> Path:
+    """Copy normalized records + original media into reference-v1 + manifest.
+
+    Layout separates language-neutral facts from profile enrichment:
+      characters/U+*.json      full normalized record (facts + media +
+                               this run's enrichment, with target_language)
+      enrichment/<lang>/U+*.json  sidecar with ONLY the learner-language
+                               enrichment (references, never duplicates,
+                               stroke/audio bytes)
+    Consumers that only need facts can ignore enrichment/ entirely.
+    """
+    char_dir = publish_dir / "characters"
+    stroke_dir = publish_dir / "strokes"
+    audio_dir = publish_dir / "audio"
+    index_dir = publish_dir / "indexes"
+    license_dir = publish_dir / "licenses"
+    enrichment_dir = publish_dir / "enrichment" / target_language
+    for d in (char_dir, stroke_dir, audio_dir, index_dir, license_dir,
+              enrichment_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    sources_manifest = _read_sources_manifest()
+    published_files: dict[str, str] = {}
+    stroke_index_entries = []
+    missing_strokes = []
+    missing_audio = [m.get("char") for m in audio_missing]
+
+    for char in chars:
+        ucs = f"{ord(char):04X}"
+        src_record = CARD_CACHE_DIR / f"U+{ucs}.json"
+        if not src_record.exists():
+            missing_strokes.append(char)
+            continue
+        record = json.loads(src_record.read_text(encoding="utf-8"))
+        dst_record = char_dir / f"U+{ucs}.json"
+        dst_record.write_text(
+            json.dumps(record, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        published_files[f"characters/U+{ucs}.json"] = sha256_file(dst_record)
+
+        # Enrichment sidecar: learner-language data only, no media
+        # duplication. Points back at the character record + media files.
+        sidecar = {
+            "schema": CLEAN_SCHEMA_VERSION,
+            "char": record.get("char", char),
+            "ucs": record.get("ucs", ucs),
+            "target_language": record.get("target_language", target_language),
+            "enrichment": record.get("enrichment", {}),
+            "character_ref": f"characters/U+{ucs}.json",
+        }
+        dst_sidecar = enrichment_dir / f"U+{ucs}.json"
+        dst_sidecar.write_text(
+            json.dumps(sidecar, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        published_files[f"enrichment/{target_language}/U+{ucs}.json"] = (
+            sha256_file(dst_sidecar))
+
+        # Original stroke bytes (no geometry rewrite).
+        xml_src = MOE_STROKE_XML.glob(f"U+{ucs}__ID*.xml")
+        xml_hits = sorted(xml_src)
+        if xml_hits:
+            dst_xml = stroke_dir / xml_hits[0].name
+            if not dst_xml.exists():
+                shutil.copy2(xml_hits[0], dst_xml)
+            published_files[f"strokes/{dst_xml.name}"] = sha256_file(dst_xml)
+            stroke_index_entries.append({
+                "char": char, "ucs": ucs,
+                "file": f"strokes/{dst_xml.name}",
+            })
+        else:
+            missing_strokes.append(char)
+
+    # Audio: copy original packaged bytes referenced by card records.
+    for char in chars:
+        ucs = f"{ord(char):04X}"
+        rec_path = char_dir / f"U+{ucs}.json"
+        if not rec_path.exists():
+            continue
+        rec = json.loads(rec_path.read_text(encoding="utf-8"))
+        fname = ((rec.get("media") or {}).get("audio") or {}).get("filename", "")
+        if not fname:
+            continue
+        src_media = BUILD_MEDIA / fname
+        if src_media.exists():
+            dst = audio_dir / fname
+            if not dst.exists():
+                shutil.copy2(src_media, dst)
+            published_files[f"audio/{fname}"] = sha256_file(dst)
+
+    complete = generation_mode == "official" and not generation_errors
+    manifest = {
+        "schema_version": CLEAN_SCHEMA_VERSION,
+        "dataset_version": REFERENCE_DATASET_VERSION,
+        "generation_mode": generation_mode,
+        "complete": complete,
+        "character_count": len(chars),
+        "target_language": target_language,
+        "unicode_version": UNICODE_VERSION,
+        "sources": sources_manifest.get("sources", []),
+        "source_licenses": sources_manifest.get("licenses", {}),
+        "prompt_version": PROMPT_VERSION,
+        # Model ALIAS only — never the private endpoint URL.
+        "llm_model": llm_model,
+        "files": published_files,
+        "counts": {
+            "requested": len(chars),
+            "errors": len(generation_errors),
+            "audio_missing": len(audio_missing),
+            "missing_strokes": missing_strokes,
+            "missing_audio_chars": missing_audio,
+        },
+        "notes": (
+            "TEST output is incomplete by design; "
+            "OFFICIAL output is the full supported set."
+            if generation_mode == "test" else
+            "Official complete snapshot."
+        ),
+    }
+    manifest_path = publish_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (index_dir / "index.json").write_text(
+        json.dumps({"strokes": stroke_index_entries},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (license_dir / "ATTRIBUTION.txt").write_text(
+        "Stroke-order geometry + pronunciation audio: "
+        "中華民國教育部 (MOE Taiwan).\n"
+        "Factual text (readings/radicals/strokes/variants/English "
+        "definitions): Unicode Unihan "
+        f"{UNICODE_VERSION} (https://www.unicode.org/license.html).\n"
+        "Learner-language glosses, structure notes, examples: "
+        "AI-generated, for learning reference only.\n",
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
+# =============================================================================
 # Selection
 # =============================================================================
 
@@ -1986,20 +2767,28 @@ def parse_chars_arg(value: str) -> list[str]:
 def select_characters(
     stroke_index: StrokeIndex,
     args,
-) -> list[str]:
-    # Production default: generate ALL characters for which download.py
-    # successfully prepared offline MOE stroke XML.
-    #
-    # Use --chars for an explicit subset, or --limit N for a short test run.
+    config: dict,
+) -> tuple[list[str], str]:
+    """TEST mode returns EXACTLY [config test_character].
+
+    Not `limit=1` after arbitrary ordering: the character comes from config
+    (CLI --test-char overrides). OFFICIAL mode returns the full supported
+    set (explicit --chars/--limit still work as debug overrides).
+    """
     if args.chars:
-        chars = parse_chars_arg(args.chars)
-    else:
+        return parse_chars_arg(args.chars), "debug --chars override"
+    mode = (args.mode or config.get("mode", "test")).lower()
+    if mode == "official":
         chars = list(stroke_index.ordered_chars)
-
-    if args.limit > 0:
-        chars = chars[:args.limit]
-
-    return chars
+        if args.limit > 0:
+            chars = chars[:args.limit]
+        return chars, "official"
+    test_char = args.test_char or config.get("test_character", "思")
+    test_char = nfc(test_char)
+    if len(test_char) != 1:
+        raise ValueError(
+            f"Test mode needs exactly one character, got {test_char!r}")
+    return [test_char], "test"
 
 
 # =============================================================================
@@ -2025,18 +2814,29 @@ def main() -> None:
         "--limit",
         type=int,
         default=0,
-        help="Limit selected characters. 0 = no limit.",
+        help="Debug only: limit selected characters. 0 = no limit.",
+    )
+    parser.add_argument(
+        "--mode",
+        default="",
+        choices=["", "test", "official"],
+        help="Generation mode. Default: read from config/config.local.json (test).",
+    )
+    parser.add_argument(
+        "--test-char",
+        default="",
+        help="Debug override for the single test character.",
     )
 
     parser.add_argument(
         "--llm-base-url",
-        default="http://100.123.148.6:8080/v1",
-        help="llama.cpp OpenAI-compatible base URL.",
+        default="",
+        help="llama.cpp OpenAI-compatible base URL. Default: config/config.local.json.",
     )
     parser.add_argument(
         "--llm-model",
-        default="qwen3",
-        help="Model/alias exposed by llama-server.",
+        default="",
+        help="Model/alias exposed by llama-server. Default: config/config.local.json.",
     )
     parser.add_argument(
         "--refresh-ai",
@@ -2046,69 +2846,95 @@ def main() -> None:
     parser.add_argument(
         "--no-ai",
         action="store_true",
-        help="Debug only: do not call LLM; Vietnamese fields stay minimal.",
+        help="Debug only: do not call LLM; enrichment fields stay minimal.",
+    )
+    parser.add_argument(
+        "--profile",
+        default="",
+        help="Learner-language profile (config/profiles/<code>.json). "
+        "Default: read from config (vi).",
     )
 
     parser.add_argument(
         "--deck-name",
-        default="Taiwan Traditional Chinese - MOE",
+        default="",
+        help="Deck name. Default: config/config.local.json.",
     )
     parser.add_argument(
         "--output",
-        default=str(BUILD / "taiwan_traditional_chinese.apkg"),
+        default="",
+        help="Output .apkg path. Default: config/config.local.json.",
+    )
+
+    parser.add_argument(
+        "--publish-dir",
+        default=str(PUBLISHED_ROOT),
+        help="Published reference-v1 root. Default: data/published/reference-v1.",
     )
 
     args = parser.parse_args()
+    config = load_local_config()
+    profile = load_profile(args.profile or config.get("profile", "vi"))
+    target_language = str(profile.get("language_code", "vi") or "vi")
+    labels = profile_labels(profile)
+    show_han_viet = bool((profile.get("features") or {}).get(
+        "show_han_viet", target_language == "vi"))
+
+    llm_base_url = args.llm_base_url or config["llm"]["base_url"]
+    llm_model = args.llm_model or config["llm"]["model"]
+    llm_timeout = int(config["llm"].get("timeout_seconds", 180))
+    deck_name = args.deck_name or config["generation"]["deck_name"]
+    output_default = config["generation"]["output"]
 
     ensure_dirs()
 
     print("==============================================")
-    print("Load deterministic sources")
+    print("Load clean-v1 sources (Unihan + MOE stroke + MOE audio)")
     print("==============================================")
 
-    dictionary = MoeDictionary(MOE_DICT_TEXT)
-    hanviet = HanVietIndex(HANVIET_CSV)
-    chise = ChiseIndex(CHISE_DIR)
-    unihan = UnihanFallback(UNIHAN_DIR)
+    unihan = UnihanIndex(UNIHAN_DIR, UNICODE_DIR / "CJKRadicals.txt")
     strokes = StrokeIndex()
-    audio = AudioResolver(MOE_DICT_AUDIO)
+    audio = CleanAudioResolver(MOE_DICT_AUDIO)
 
-    grounder = Grounder(
-        dictionary=dictionary,
-        hanviet=hanviet,
-        chise=chise,
-        unihan=unihan,
-        strokes=strokes,
-    )
+    grounder = CleanGrounder(unihan=unihan, strokes=strokes)
 
     llm = None
     if not args.no_ai:
+        if not llm_base_url:
+            raise SystemExit(
+                "No LLM base URL configured. Set llm.base_url in "
+                "config/config.local.json (see config/config.example.json) "
+                "or pass --llm-base-url for debugging."
+            )
         llm = LLMClient(
-            base_url=args.llm_base_url,
-            model=args.llm_model,
+            base_url=llm_base_url,
+            model=llm_model,
+            timeout=llm_timeout,
         )
+        llm.session.trust_env = bool(config["llm"].get("trust_env", False))
 
-    chars = select_characters(strokes, args)
-
-    selection_mode = (
-        f"explicit --chars ({len(chars)})"
-        if args.chars
-        else "all downloaded stroke characters"
-    )
+    chars, generation_mode = select_characters(strokes, args, config)
+    refresh_ai = args.refresh_ai or bool(
+        config["generation"].get("refresh_ai", False))
 
     print()
     print("==============================================")
-    print(f"Selection mode     : {selection_mode}")
+    print(f"Generation mode    : {generation_mode}")
+    print(f"Target language    : {target_language} "
+          f"({profile.get('language_name', '')})")
+    print(f"Prompt version     : {PROMPT_VERSION}")
     print(f"Selected characters: {len(chars)}")
+    if generation_mode == "test":
+        print("(test output is marked incomplete; see reference manifest)")
     print("==============================================")
     print("".join(chars[:100]))
     if len(chars) > 100:
         print("...")
 
-    model = build_anki_model()
+    model = build_anki_model(profile)
     deck = genanki.Deck(
         ANKI_DECK_ID,
-        args.deck_name,
+        deck_name,
     )
 
     media_files: list[Path] = prepare_support_media()
@@ -2126,38 +2952,35 @@ def main() -> None:
 
         try:
             grounding = grounder.build(char)
+            facts = grounder.facts_block(grounding)
 
             if args.no_ai:
                 enrichment = {
-                    "meaning_vi": "",
-                    "structure_explanation_vi": "",
-                    "component_meanings_vi": {},
+                    "meaning": "",
+                    "han_viet_suggestion": "",
+                    "structure_explanation": "",
+                    "components_generated": [],
+                    "component_meanings": {},
                     "examples": [],
                 }
             else:
                 assert llm is not None
                 enrichment = llm.enrich(
                     grounding,
-                    refresh=args.refresh_ai,
+                    facts,
+                    profile,
+                    refresh=refresh_ai,
                 )
 
             # -------------------------------------------------------------
-            # Audio: primary MOE dictionary reading only.
+            # Audio: MOE original bytes, char-based match, no dict IDs.
             # -------------------------------------------------------------
 
-            source_audio = None
-            audio_info = {
-                "reason": "no_moe_dictionary_entry"
-            }
-
-            primary_entry = dictionary.primary(char)
-            if primary_entry is not None:
-                source_audio, audio_info = audio.resolve(
-                    primary_entry
-                )
+            source_audio, audio_info = audio.resolve(char)
 
             audio_field = ""
             audio_filename = ""
+            audio_sha256 = ""
 
             if source_audio is not None:
                 anki_audio = copy_audio_for_anki(
@@ -2166,6 +2989,7 @@ def main() -> None:
                 )
                 media_files.append(anki_audio)
                 audio_filename = anki_audio.name
+                audio_sha256 = sha256_file(anki_audio)
                 audio_field = (
                     f"[sound:{anki_audio.name}]"
                 )
@@ -2177,8 +3001,7 @@ def main() -> None:
                 audio_missing.append({
                     "char": char,
                     "ucs": grounding.ucs,
-                    "pinyin": grounding.primary.pinyin,
-                    "word_id": grounding.primary.word_id,
+                    "pinyin": grounding.pinyin,
                     "match": audio_info,
                 })
                 print(
@@ -2187,33 +3010,40 @@ def main() -> None:
                 )
 
             # -------------------------------------------------------------
-            # Stroke XML is embedded directly into the note as Base64.
+            # Stroke XML: original MOE bytes, base64-encoded directly.
+            # No geometry parsing/regeneration (clean-v1 §6).
             # -------------------------------------------------------------
 
             xml_path = Path(grounding.stroke_xml_path)
-            xml_text = xml_path.read_text(
-                encoding="utf-8"
-            )
-            stroke_b64 = base64.b64encode(
-                xml_text.encode("utf-8")
-            ).decode("ascii")
+            xml_bytes = xml_path.read_bytes()
+            stroke_sha256 = hashlib.sha256(xml_bytes).hexdigest()
+            stroke_b64 = base64.b64encode(xml_bytes).decode("ascii")
 
             # -------------------------------------------------------------
-            # Render HTML fields
+            # HanViet display field: optional profile feature
+            # (features.show_han_viet). kVietnamese stays in the record
+            # with provenance; non-opted-in profiles render it empty and
+            # the template hides the block via {{#HanViet}}.
             # -------------------------------------------------------------
 
-            component_html = components_html(
-                grounding,
-                enrichment,
-            )
+            hanviet_display = ""
+            if show_han_viet:
+                hanviet_display = (
+                    grounding.vietnamese_raw
+                    or enrichment.get("han_viet_suggestion", "")
+                )
 
-            other_readings = readings_html(
-                grounding.primary,
-                grounding.other_readings,
-            )
+            # -------------------------------------------------------------
+            # Render HTML fields (template structure unchanged)
+            # -------------------------------------------------------------
+
+            component_html = clean_components_html(enrichment, labels)
+
+            other_readings = clean_readings_html(
+                grounding.pinyin_alternates, labels)
 
             ex_html = examples_html(
-                enrichment.get("examples", [])
+                enrichment.get("examples", []), labels
             )
 
             note = genanki.Note(
@@ -2224,14 +3054,14 @@ def main() -> None:
                 ),
                 fields=[
                     char,
-                    grounding.primary.bopomofo,
-                    grounding.primary.pinyin,
-                    grounding.primary.han_viet,
-                    enrichment.get("meaning_vi", ""),
-                    grounding.primary.definition_zh,
-                    grounding.ids,
+                    grounding.zhuyin,
+                    grounding.pinyin,
+                    hanviet_display,
+                    enrichment.get("meaning", ""),
+                    grounding.definition_en,
+                    clean_variants_text(grounding),
                     enrichment.get(
-                        "structure_explanation_vi",
+                        "structure_explanation",
                         "",
                     ),
                     component_html,
@@ -2239,7 +3069,7 @@ def main() -> None:
                     stroke_b64,
                     audio_field,
                     ex_html,
-                    MOE_ATTRIBUTION,
+                    build_attribution(profile),
                 ],
             )
 
@@ -2250,6 +3080,11 @@ def main() -> None:
                 enrichment,
                 audio_info,
                 audio_filename,
+                audio_sha256,
+                stroke_sha256,
+                None if args.no_ai else llm_model,
+                generation_mode,
+                target_language,
             )
 
             write_json(
@@ -2284,7 +3119,7 @@ def main() -> None:
         seen_media.add(resolved)
         unique_media.append(path)
 
-    output = Path(args.output)
+    output = Path(args.output or output_default)
     output.parent.mkdir(parents=True, exist_ok=True)
 
     package = genanki.Package(deck)
@@ -2294,6 +3129,16 @@ def main() -> None:
     ]
 
     package.write_to_file(str(output))
+
+    publish_manifest = publish_reference(
+        chars,
+        generation_mode,
+        None if args.no_ai else llm_model,
+        audio_missing,
+        generation_errors,
+        Path(args.publish_dir),
+        target_language,
+    )
 
     write_json(
         BUILD_REPORTS / "audio_missing.json",
@@ -2311,15 +3156,16 @@ def main() -> None:
             "errors": len(generation_errors),
             "audio_missing": len(audio_missing),
             "output": str(output),
-            "llm_base_url": (
-                None if args.no_ai
-                else args.llm_base_url
-            ),
+            # Local alias only; the endpoint URL stays in local config.
             "llm_model": (
                 None if args.no_ai
-                else args.llm_model
+                else llm_model
             ),
             "prompt_version": PROMPT_VERSION,
+            "unicode_version": UNICODE_VERSION,
+            "generation_mode": generation_mode,
+            "target_language": target_language,
+            "publish_manifest": str(publish_manifest),
         },
     )
 
@@ -2327,11 +3173,14 @@ def main() -> None:
     print("==============================================")
     print("DONE")
     print("==============================================")
+    print(f"Mode             : {generation_mode}")
+    print(f"Target language  : {target_language}")
     print(f"Requested      : {len(chars)}")
     print(f"Generated      : {generated}")
     print(f"Errors         : {len(generation_errors)}")
     print(f"Audio missing  : {len(audio_missing)}")
     print(f"Output         : {output}")
+    print(f"Publish manifest : {publish_manifest}")
     print(
         f"Reports        : {BUILD_REPORTS}"
     )
